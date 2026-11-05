@@ -489,7 +489,7 @@ function construirMenu() {
   for (const p of PAGINAS) {
     if (p.permiso && !puede(p.permiso)) continue;
     if (p.grupo !== grupo) { grupo = p.grupo; nav.append(h('div', { class: 'grupo' }, grupo)); }
-    nav.append(h('a', { href: `#${p.id}`, dataset: { id: p.id } }, h('span', { class: 'nav-item' }, icono(p.id), p.titulo), p.pronto ? h('span', { class: 'pronto' }, 'Próx.') : null));
+    nav.append(h('a', { href: `#${p.id}`, dataset: { id: p.id }, title: p.titulo }, h('span', { class: 'nav-item' }, icono(p.id), h('span', { class: 'nav-txt' }, p.titulo)), p.pronto ? h('span', { class: 'pronto' }, 'Próx.') : null));
   }
 }
 
@@ -1116,6 +1116,7 @@ function productoSolicitud(loteId, p, listas, alGuardar) {
     via_administracion: campo('m_via_administracion', 'Vía de administración', { valor: prop.molecula?.via_administracion, sugerencias: listas.molecula.via_administracion }),
     pos_no_pos: campo('m_pos_no_pos', 'POS / NO POS', { opciones: opciones(['POS', 'NO POS']), valor: prop.molecula?.pos_no_pos }),
     cadena_frio: campo('m_cadena_frio', 'Cadena de frío', { opciones: opciones(listas.molecula.listas.cadena_frio), valor: prop.molecula?.cadena_frio }),
+    clasificacion_entrega: campo('m_clasificacion_entrega', 'Clasificación de entrega', { opciones: opciones(listas.molecula.listas.clasificacion_entrega || []), valor: prop.molecula?.clasificacion_entrega }),
   };
   const asignar = campo('asignar_pos', 'Asignar POS / NO POS (lo aprueba el Administrador)', { opciones: opciones(['POS', 'NO POS']), valor: prop.asignar_pos });
   const unidadOrden = campo('unidad_orden', 'Unidad de orden de la presentación nueva (ej. CX30)', { valor: prop.presentacion?.unidad_orden });
@@ -1383,7 +1384,7 @@ async function panelAprobaciones(alCambiar) {
     const campos = {
       MOLECULA: [['cod_gen_audifarma', 'Código genérico Audifarma'], ['descripcion_general', 'Descripción genérica'], ['concentracion_agrupada', 'Concentración'],
         ['principio_activo', 'Principio activo'], ['forma_farmaceutica', 'Forma farmacéutica'], ['grupo_farmacologico', 'Grupo farmacológico'], ['via_administracion', 'Vía'],
-        ['pos_no_pos', 'POS / NO POS'], ['cadena_frio', 'Cadena de frío']],
+        ['pos_no_pos', 'POS / NO POS'], ['cadena_frio', 'Cadena de frío'], ['clasificacion_entrega', 'Clasificación de entrega']],
       LABORATORIO: [['nombre', 'Nombre del laboratorio']],
       PRESENTACION: [['envase', 'Envase'], ['cantidad', 'Cantidad'], ['unidad_orden', 'Unidad de orden']],
       ASIGNAR_POS: [['cod_gen_audifarma', 'COD GEN'], ['pos_no_pos', 'POS / NO POS']],
@@ -1392,6 +1393,8 @@ async function panelAprobaciones(alCambiar) {
       titulo: `Aprobar: ${SOL_TIPOS_APROBACION[a.tipo]}`, texto: `Producto fila ${a.fila}. Revise y corrija si hace falta: al aprobar se aplica en el catálogo y se revalida.`
         + (a.tipo === 'MOLECULA' ? ' El Código Medicar se asigna solo (siguiente consecutivo libre).' : ''),
       campos: campos.map(([k, t]) => (k === 'pos_no_pos' ? { nombre: k, etiqueta: t, tipo: 'select', valor: d[k], opciones: [['POS', 'POS'], ['NO POS', 'NO POS']] }
+        : k === 'clasificacion_entrega' ? { nombre: k, etiqueta: t, tipo: 'select', valor: d[k] ?? '', requerido: true,
+          opciones: [['', 'Seleccione…'], ['MTOS DE APLICACION', 'MTOS DE APLICACIÓN'], ['ALTO COSTO', 'ALTO COSTO'], ['AMBULATORIO', 'AMBULATORIO']] }
         : { nombre: k, etiqueta: t, valor: d[k] ?? '', requerido: !['cadena_frio'].includes(k) })),
       aceptar: 'Aprobar',
       alEnviar: (v) => resolver(a, true, v),
@@ -1677,6 +1680,7 @@ async function pNota(c) {
     { titulo: 'FORMA FARMACEUTICA RIPS', campo: 'ffm_rips' },
     { titulo: 'CONCENTRACION RIPS', campo: 'umm_rips' },
     { titulo: 'UNIDAD MEDIDA RIPS', campo: 'upr_rips' },
+    { titulo: 'CLASIFICACION DE ENTREGA', campo: 'clasificacion_entrega' }, // del catálogo COD GEN por COD AUF, después de los RIPS (2026-11-05)
     { titulo: 'OBSERVACIONES', campo: 'reglas', valor: (f) => {
       // validada, con alerta o con error (pedido del usuario, 2026-11-05); la inactiva no se valida
       const m = f.motivos || [];
@@ -2010,12 +2014,13 @@ function editarNT(f, alGuardar, base = {}) {
   const txt = (v, attrs = {}) => { const e = h('input', { type: 'text', autocomplete: 'off', ...attrs }); e.value = v ?? ''; return e; };
   const sel = (v, ops) => { const e = h('select', {}, ...ops.map(([a, b]) => h('option', { value: a }, b))); e.value = v; return e; };
   const ro = (v) => h('input', { value: v ?? '', readonly: true, class: 'solo-lectura', tabindex: -1 });
+  // Vista de edición (pedido del usuario, 2026-11-05): editables solo CUM a facturar, tipo, COD MUTUAL, CUM, datos INVIMA / RIPS, precio,
+  // IVA y estado. Contrato y subplán salen de los listados; COD AUF, descripción y COD GEN SIESA del catálogo COD GEN (moléculas);
+  // la descripción completa del Maestro SIESA.
   const c = {
+    cum_facturar: txt(f.cum_facturar),
     cum: txt(f.cum, { placeholder: 'CUM, NO APLICA, VITAL NO DISPONIBLE…' }),
-    cod_auf: txt(f.cod_auf),
     tipo_producto: sel(f.tipo_producto ?? '', [['', 'Automático (según el CUM a facturar)'], ['714', '714 · Medicamento'], ['799', '799 · Insumo']]),
-    descripcion: txt(f.descripcion),
-    cod_gen_siesa: txt(f.cod_gen_siesa),
     cod_mutual: txt(f.cod_mutual),
     // 7F: en CAPITA el precio sale del Listado Cápita (con tope en el regulado); EVENTO y EVENTO SAS se digitan (el contrato es el tope)
     precio_venta: f.fuente_precio && f.fuente_precio !== 'DIGITADO' ? h('input', { type: 'number', value: f.precio_venta ?? '', readonly: true, class: 'solo-lectura', tabindex: -1 })
@@ -2023,16 +2028,30 @@ function editarNT(f, alGuardar, base = {}) {
     iva: sel(String(Number(f.iva) ? 0.19 : 0), [['0', '0 %'], ['0.19', '19 %']]),
   };
   const conFuente = !!f.fuente_precio && f.fuente_precio !== 'DIGITADO';
+  // datos INVIMA / RIPS: el de la Maestra Tarifaria si se editó; vacío = el de SIESA (ATC, RIPS) o INVIMA (registro y estado)
+  const DATOS_MT = [['atc', 'ATC', 'SIESA'], ['registro_sanitario', 'Registro sanitario', 'INVIMA'], ['estado_registro', 'Estado del registro', 'INVIMA'],
+    ['ffm_rips', 'Forma farmacéutica RIPS', 'SIESA'], ['umm_rips', 'Concentración RIPS', 'SIESA'], ['upr_rips', 'Unidad de medida RIPS', 'SIESA']];
+  const COL_MT = { atc: 'atc_mt', registro_sanitario: 'registro_mt', estado_registro: 'estado_registro_mt', ffm_rips: 'ffm_rips_mt', umm_rips: 'umm_rips_mt', upr_rips: 'upr_rips_mt' };
+  const fuente = f.datos_fuente || {};
+  const dm = Object.fromEntries(DATOS_MT.map(([k]) => [k, txt(f[k] ?? '', { placeholder: fuente[k] ? '' : 'Sin dato' })]));
+  const estadoReg = autocompletar(dm.estado_registro, ['VIGENTE', 'EN TRAMITE RENOV', 'TEMP. NO COMERC - VIGENTE', 'VENCIDO', 'PERDIDA FUERZA EJEC', 'CANCELADO', 'SUSPENDIDO', 'NEGADO']);
+  const descCat = f.descripcion_catalogo || f.descripcion || ''; const genCat = f.cod_gen_catalogo || f.cod_gen_siesa || '';
+  const avisoCf = h('span', { class: 'nota aviso', hidden: true }, '');
+  c.cum_facturar.addEventListener('input', () => {
+    const otro = c.cum_facturar.value.trim().toUpperCase() !== String(f.cum_facturar).toUpperCase();
+    avisoCf.textContent = otro ? `Se cambia de ${f.cum_facturar} a ${c.cum_facturar.value.trim().toUpperCase()} en todos los contratos del CUM, con sus PLU de SIESA.` : '';
+    avisoCf.hidden = !otro;
+  });
   // la inactivación es por PLU (aclaración del usuario, 2026-11-05): el interruptor es del PLU de la fila y se aplica en todas las líneas
   // del CUM que lo tienen (todos sus contratos y subplanes); sin PLU, es de la línea
   const porPlu = !!(f.plu && f.id);
   const lineaActiva = Number(f.activo_linea ?? f.activo) === 1;
   const activoInicial = porPlu ? Number(f.activo) === 1 : lineaActiva;
   let activo = activoInicial;
-  const txtEstado = () => (activo ? 'Activo' + (porPlu ? '' : 'a') : porPlu ? 'Inactivo: este PLU no se valida ni se usa en este contrato' : 'Inactiva: no se valida ni se usa al crear productos');
+  const txtEstado = () => (porPlu ? `PLU ${f.plu} ${activo ? 'activo' : 'inactivo'}` : `Línea ${activo ? 'activa' : 'inactiva'}`);
   const interruptor = h('button', { type: 'button', class: `interruptor${activo ? ' on' : ''}`, role: 'switch', 'aria-checked': String(activo), 'aria-label': porPlu ? `PLU ${f.plu} activo` : 'Línea activa',
     onclick: () => { activo = !activo; interruptor.classList.toggle('on', activo); interruptor.setAttribute('aria-checked', String(activo)); estadoTxt.textContent = txtEstado(); } }, h('span', {}));
-  const estadoTxt = h('span', { class: 'nota' }, txtEstado());
+  const estadoTxt = h('strong', {}, txtEstado());
   // precio final con IVA, en vivo
   const final = ro('');
   const calcFinal = () => { const p = Number(c.precio_venta.value); final.value = c.precio_venta.value === '' ? '' : pesos(Math.round(p * (1 + Number(c.iva.value)))); };
@@ -2053,18 +2072,24 @@ function editarNT(f, alGuardar, base = {}) {
         h('div', { class: 'lista-val' }, ...motivos.map((m) => h('div', { class: `val-item ${m.nivel === 'ERROR' ? 'v-error' : 'v-alerta'}` },
           h('div', { class: 'val-cab' }, svgIcono(m.nivel === 'ERROR' ? 'error' : 'alerta'), h('strong', {}, m.codigo), h('span', {}, ` ${m.texto}`),
             m.codigo === 'NT29' && f.id ? botonAprobarVarios(f, m, () => { dlg.close(); alGuardar(); }) : null))))) : null,
-      seccion(1, 'Identificación', campo('cum_facturar', 'CUM a facturar', ro(f.cum_facturar)), campo('contrato', 'Contrato · subplán', ro(lineaNT(f.contrato))),
-        campo('cum', 'CUM', c.cum), campo('cod_auf', 'COD AUF', c.cod_auf), campo('tipo_producto', 'Tipo de producto', c.tipo_producto)),
-      seccion(2, 'Producto y códigos', h('div', { class: 'ancho-doble' }, campo('descripcion', 'Descripción', c.descripcion)),
-        campo('cod_gen_siesa', 'COD GEN SIESA', c.cod_gen_siesa, 'Vacío: se toma del Maestro SIESA por el CUM.'),
-        campo('cod_mutual', 'COD MUTUAL', c.cod_mutual, 'Con este código se valida el contrato y el precio.')),
-      seccion(3, 'Precio y estado', campo('precio_venta', 'Precio de venta (sin IVA)', c.precio_venta, conFuente
-        ? `Calculado: ${({ 'LISTADO CAPITA': 'Listado Cápita', 'PRECIO REGULADO': 'tope del precio regulado' })[f.fuente_precio] || f.fuente_precio} ÷ (1 + IVA). No se digita.`
-        : f.contrato === 'CAPITA' ? 'Sin tarifa en el Listado Cápita: se usa el precio digitado.'
-          : 'Precio propio de la línea: el Contrato Evento es el tope (si el precio final lo supera, GLOSA TARIFA).'), campo('iva', 'IVA', c.iva),
+      seccion(1, 'Identificación', h('label', {}, 'CUM a facturar', c.cum_facturar, avisoCf),
+        h('label', {}, 'Contrato', ro(f.contrato_vista || f.contrato)),
+        h('label', {}, 'Subplán', ro(f.subplan || 'Sin subplán')),
+        campo('tipo_producto', 'Tipo de producto', c.tipo_producto)),
+      // sin notas de ayuda (pedido del usuario, 2026-11-05): solo se avisa si se cambia el CUM a facturar
+      seccion(2, 'Producto y códigos',
+        h('label', {}, 'COD AUF', ro(f.cod_auf)),
+        h('label', { class: 'ancho-doble' }, 'Descripción', ro(descCat)),
+        h('label', {}, 'COD GEN SIESA', ro(genCat)),
+        campo('cod_mutual', 'COD MUTUAL', c.cod_mutual),
+        h('label', {}, 'PLU', ro(f.plu || f.referencia_siesa || 'Sin PLU en SIESA')),
+        h('label', {}, 'Clasificación de entrega', ro(f.clasificacion_entrega || 'Sin asignar')),
+        h('label', { class: 'ancho-doble' }, 'Descripción completa', ro(f.descripcion_siesa || 'No está en el Maestro SIESA'))),
+      seccion(3, 'Información INVIMA y RIPS', campo('cum', 'CUM', c.cum),
+        ...DATOS_MT.map(([k, etiqueta]) => campo(`mt_${k}`, etiqueta, k === 'estado_registro' ? estadoReg : dm[k]))),
+      seccion(4, 'Precio y estado', campo('precio_venta', 'Precio de venta (sin IVA)', c.precio_venta), campo('iva', 'IVA', c.iva),
         h('label', {}, 'Precio final + IVA', final),
-        h('div', { class: 'campo-interruptor ancho-total' }, interruptor, h('strong', {}, porPlu ? `PLU ${f.plu} activo` : 'Línea activa'), estadoTxt,
-          porPlu ? h('span', { class: 'nota' }, 'Cambia este PLU en todos los contratos y subplanes del CUM; los demás PLU quedan igual.') : null))),
+        h('div', { class: 'campo-interruptor ancho-total' }, interruptor, estadoTxt))),
     err,
     h('div', { class: 'form-pie' }, h('span', { class: 'espacio' }),
       h('button', { class: 'btn sec', value: 'cancelar', formnovalidate: true }, 'Cancelar'),
@@ -2073,17 +2098,21 @@ function editarNT(f, alGuardar, base = {}) {
     if (ev.submitter?.value === 'cancelar') return;
     ev.preventDefault(); err.textContent = '';
     if (!c.cod_mutual.value.trim()) { err.textContent = 'El COD MUTUAL es obligatorio.'; return; }
+    if (!c.cum_facturar.value.trim()) { err.textContent = 'El CUM a facturar es obligatorio.'; return; }
     const v = Object.fromEntries(Object.entries(c).map(([k, e]) => [k, e.value]));
     if (conFuente) v.precio_venta = f.precio_digitado ?? ''; // el calculado no se guarda como digitado
+    // igual al de SIESA / INVIMA = no se guarda como propio (sigue al de SIESA / INVIMA)
+    const norm = (x) => String(x ?? '').trim().replace(/\s+/g, ' ').toUpperCase();
+    const datosMt = Object.fromEntries(DATOS_MT.map(([k]) => [k, norm(dm[k].value) === norm(fuente[k]) ? '' : dm[k].value]));
     try {
-      const r = await api('nt_guardar', { metodo: 'POST', datos: { ...v, id: f.id, activo: porPlu ? lineaActiva : activo } }); // mismos campos que enviaba el formulario anterior
+      const r = await api('nt_guardar', { metodo: 'POST', datos: { ...v, datos_mt: datosMt, id: f.id, activo: porPlu ? lineaActiva : activo } });
       let cambioPlu = false;
       if (porPlu && activo !== activoInicial) { // solo este PLU + CONTRATO; queda en auditoría con el PLU
         await api('nt_activar_masivo', { metodo: 'POST', datos: { filas: [`${f.id}|${f.plu}`], activar: activo, motivo: 'Desde el formulario de edición' } });
         cambioPlu = true;
       }
       dlg.close();
-      toast(r.cambios || cambioPlu ? `Guardado.${cambioPlu ? ` PLU ${f.plu} ${activo ? 'activado' : 'inactivado'} en este contrato.` : ''} Validaciones recalculadas.${r.lineas_repetidas ? ` Se crearon ${r.lineas_repetidas} líneas en otros contratos.` : ''}` : 'Sin cambios.');
+      toast(r.cambios || cambioPlu ? `Guardado.${r.renombrado ? ` CUM a facturar cambiado a ${r.renombrado} en ${r.lineas} línea(s).` : ''}${cambioPlu ? ` PLU ${f.plu} ${activo ? 'activado' : 'inactivado'} en este contrato.` : ''} Validaciones recalculadas.${r.lineas_repetidas ? ` Se crearon ${r.lineas_repetidas} líneas en otros contratos.` : ''}` : 'Sin cambios.');
       alGuardar();
     } catch (e) { err.textContent = e.message; }
   };
@@ -2275,7 +2304,7 @@ function panelImportarNT(abierto, alAplicar, titulo = 'Importar / actualizar des
 }
 
 const CATS = [
-  ['molecula', 'COD GEN (moléculas)', [['cod_gen_audifarma', 'Cód. Audifarma'], ['descripcion_general', 'Descripción'], ['codigo_medicar', 'Cód. Medicar'], ['concentracion_agrupada', 'Concentración'], ['principio_activo', 'Principio activo'], ['forma_farmaceutica', 'Forma'], ['via_administracion', 'Vía'], ['cadena_frio', 'Frío'], ['activo', 'Estado']]],
+  ['molecula', 'COD GEN (moléculas)', [['cod_gen_audifarma', 'Cód. Audifarma'], ['descripcion_general', 'Descripción'], ['codigo_medicar', 'Cód. Medicar'], ['concentracion_agrupada', 'Concentración'], ['principio_activo', 'Principio activo'], ['forma_farmaceutica', 'Forma'], ['via_administracion', 'Vía'], ['cadena_frio', 'Frío'], ['clasificacion_entrega', 'Clasificación de entrega'], ['activo', 'Estado']]],
   ['laboratorio', 'Laboratorios', [['codigo', 'Código'], ['nombre', 'Laboratorio'], ['activo', 'Estado']]],
   ['presentacion', 'Presentaciones', [['codigo', 'Código'], ['presentacion_agrupada', 'Presentación'], ['unidad_orden', 'Unidad de orden'], ['activo', 'Estado']]],
   ['subplan', 'Subplanes Medicar', [['id_subplan', 'ID'], ['nombre', 'Subplán'], ['clasificacion', 'Clasificación'], ['fuente', 'Fuente de precio'], ['activo', 'Estado']]],
@@ -2797,6 +2826,10 @@ function editarMolecula(f, sug, alGuardar, pre = {}) {
     grupo_farmacologico: autocompletar(txt(f?.grupo_farmacologico, { required: true }), sug.grupo_farmacologico || []),
     pos_no_pos: sel(f?.pos_no_pos, sug.listas.pos_no_pos),
     cadena_frio: sel(f?.cadena_frio, sug.listas.cadena_frio),
+    // clasificación de entrega (2026-11-05): obligatoria al crear; alimenta la Maestra Tarifaria por COD AUF
+    clasificacion_entrega: (() => { const e = h('select', { required: !f }, h('option', { value: '' }, f ? 'Sin asignar' : 'Seleccione…'),
+      ...(sug.listas.clasificacion_entrega || []).map((o) => h('option', { value: o }, o === 'MTOS DE APLICACION' ? 'MTOS DE APLICACIÓN' : o)));
+      e.value = f?.clasificacion_entrega ?? ''; return e; })(),
     cantidad_tope: txt(f?.cantidad_tope, { type: 'number', min: '0' }),
   };
   const nombreDe = (k) => (c[k]?.matches?.('input, select') ? c[k] : c[k]?.querySelector?.('input')); // autocompletar envuelve el campo
@@ -2807,6 +2840,22 @@ function editarMolecula(f, sug, alGuardar, pre = {}) {
   const seccion = (n, titulo, ...hijos) => h('section', { class: 'seccion-form' }, h('h3', {}, h('span', { class: 'sec-num' }, String(n)), titulo), h('div', { class: 'rejilla-form' }, ...hijos));
   // otros COD GEN con el mismo código Medicar (no se puede repetir)
   const repetido = f ? (sug.medicar_repetidos || []).find((x) => String(x.codigo) === String(f.codigo_medicar)) : null;
+  // código repetido (pedido del usuario, 2026-11-05): se asigna solo el siguiente consecutivo libre (el mayor del catálogo y de MEDICAR + 1);
+  // al guardar queda corregido. «Conservar» deja el código actual (para corregir el otro COD GEN).
+  const nuevoMedicar = repetido && sug.siguiente_medicar ? String(sug.siguiente_medicar) : null;
+  if (nuevoMedicar) c.codigo_medicar.value = nuevoMedicar;
+  const txtRep = h('span', {}, '');
+  const pintarRep = () => {
+    const otros = repetido.cod_gen.filter((x) => String(x) !== String(f.cod_gen_audifarma)).join(', ');
+    txtRep.textContent = !nuevoMedicar ? ` también lo tiene${repetido.cod_gen.length > 2 ? 'n' : ''} el COD GEN ${otros}: asigne a cada uno su propio código.`
+      : c.codigo_medicar.value === nuevoMedicar ? ` con el COD GEN ${otros}: se asignó el siguiente consecutivo ${nuevoMedicar}. Guarde para corregirlo.`
+        : ` con el COD GEN ${otros}: se conserva ${repetido.codigo}; corrija el otro COD GEN.`;
+    btnRep.textContent = c.codigo_medicar.value === nuevoMedicar ? `Conservar ${repetido.codigo}` : `Asignar ${nuevoMedicar}`;
+  };
+  const btnRep = nuevoMedicar ? h('button', { type: 'button', class: 'btn sec chico', onclick: () => {
+    c.codigo_medicar.value = c.codigo_medicar.value === nuevoMedicar ? String(repetido.codigo) : nuevoMedicar; pintarRep(); } }) : null;
+  if (repetido) { if (btnRep) pintarRep(); else txtRep.textContent = ` también lo tiene${repetido.cod_gen.length > 2 ? 'n' : ''} el COD GEN ${repetido.cod_gen.filter((x) => String(x) !== String(f.cod_gen_audifarma)).join(', ')}: asigne a cada uno su propio código.`; }
+  if (btnRep) c.codigo_medicar.addEventListener('input', pintarRep);
   const encabezado = h('div', { class: 'form-encabezado' },
     h('div', {}, h('h2', {}, f ? `Editar COD GEN ${f.cod_gen_audifarma}` : 'Nuevo COD GEN'),
       h('div', { class: 'det-sub' },
@@ -2818,8 +2867,7 @@ function editarMolecula(f, sug, alGuardar, pre = {}) {
   form.replaceChildren(encabezado,
     h('div', { class: 'form-cuerpo' },
       repetido ? h('section', { class: 'seccion-form' }, h('div', { class: 'lista-val' }, h('div', { class: 'val-item v-error' },
-        h('div', { class: 'val-cab' }, svgIcono('error'), h('strong', {}, `Código Medicar ${repetido.codigo} repetido`),
-          h('span', {}, ` también lo tiene${repetido.cod_gen.length > 2 ? 'n' : ''} el COD GEN ${repetido.cod_gen.filter((x) => String(x) !== String(f.cod_gen_audifarma)).join(', ')}: asigne a cada uno su propio código.`))))) : null,
+        h('div', { class: 'val-cab' }, svgIcono('error'), h('strong', {}, `Código Medicar ${repetido.codigo} repetido`), txtRep, btnRep)))) : null,
       seccion(1, 'Identificación',
         f ? campo(null, 'Código genérico Audifarma', ro(f.cod_gen_audifarma), 'No se modifica.') : campo('cod_gen_audifarma', 'Código genérico Audifarma', c.cod_gen_audifarma),
         f ? campo('codigo_medicar', 'Código Medicar (COD_GEN_SIESA)', c.codigo_medicar, 'No se puede repetir en otro COD GEN.')
@@ -2831,6 +2879,7 @@ function editarMolecula(f, sug, alGuardar, pre = {}) {
       seccion(3, 'Clasificación y estado',
         h('div', { class: 'ancho-doble' }, campo('pos_no_pos', 'POS / NO POS', c.pos_no_pos, 'Define el subplán de sus líneas EVENTO: EVENTO POS o EVENTO NO PBS.')),
         campo('cadena_frio', 'Cadena de frío', c.cadena_frio), campo('cantidad_tope', 'Cantidad tope', c.cantidad_tope),
+        campo('clasificacion_entrega', 'Clasificación de entrega', c.clasificacion_entrega),
         f ? h('div', { class: 'campo-interruptor ancho-total' }, interruptor, h('strong', {}, 'Activo'), estadoTxt) : null)),
     err,
     h('div', { class: 'form-pie' }, h('span', { class: 'espacio' }),
@@ -2909,17 +2958,37 @@ async function pCatalogos(c) {
       valor: ['activo', 'habilitado'].includes(campo) ? (f) => (Number(f[campo]) ? chip('Activo', 'ok') : chip('Inactivo', 'gris')) : null,
     }));
     if (editable && EDITORES[k]) {
-      const refrescarSug = async () => { Object.assign(sug, await api('catalogo_sugerencias')); t.refrescar(); };
+      // Al guardar se recalculan los códigos Medicar repetidos (aviso y filtro «Ver los N en la tabla»), pedido del usuario 2026-11-05:
+      // antes el aviso y el filtro quedaban con los de cuando se abrió el catálogo
+      const avisoRep = h('div');
+      let filtroRep = null; // COD GEN que puso «Ver los N en la tabla»
+      const repetidos = () => (sug.medicar_repetidos || []).flatMap((x) => x.cod_gen.map(String));
+      const refrescarSug = async () => {
+        Object.assign(sug, await api('catalogo_sugerencias'));
+        if (k !== 'molecula') { t.refrescar(); return; }
+        pintarRep();
+        const actual = t.filtros().cod_gen_audifarma;
+        if (filtroRep && JSON.stringify(actual) === JSON.stringify(filtroRep)) { // la tabla muestra los repetidos: se actualiza la lista
+          const nuevos = repetidos();
+          filtroRep = nuevos.length ? nuevos : null;
+          t.filtrar(nuevos.length ? { ...t.filtros(), cod_gen_audifarma: nuevos } : (({ cod_gen_audifarma, ...resto }) => resto)(t.filtros()));
+          if (!nuevos.length) toast('Ya no hay códigos Medicar repetidos.');
+          return;
+        }
+        t.refrescar();
+      };
       if (EXCEL_CATALOGOS.includes(k)) zona.append(panelExcelCatalogo(k, CATS.find(([x]) => x === k)[1], refrescarSug));
-      if (k === 'molecula' && sug.medicar_repetidos?.length) {
-        // cada COD GEN abre su ficha para corregirlo; «Ver en la tabla» filtra todos los repetidos
-        const abrir = async (cg) => {
-          const r = await api('catalogo', { params: { tipo: 'molecula', pagina: 1, filtros: JSON.stringify({ cod_gen_audifarma: [String(cg)] }) } });
-          if (r.filas[0]) EDITORES.molecula(r.filas[0], sug, refrescarSug); else toast(`No se encontró el COD GEN ${cg}.`, true);
-        };
-        const todos = sug.medicar_repetidos.flatMap((x) => x.cod_gen.map(String));
+      // cada COD GEN abre su ficha para corregirlo; «Ver en la tabla» filtra todos los repetidos
+      const abrir = async (cg) => {
+        const r = await api('catalogo', { params: { tipo: 'molecula', pagina: 1, filtros: JSON.stringify({ cod_gen_audifarma: [String(cg)] }) } });
+        if (r.filas[0]) EDITORES.molecula(r.filas[0], sug, refrescarSug); else toast(`No se encontró el COD GEN ${cg}.`, true);
+      };
+      const pintarRep = () => {
+        avisoRep.replaceChildren();
+        if (k !== 'molecula' || !sug.medicar_repetidos?.length) return;
+        const todos = repetidos();
         // compacta: una línea; el detalle (código → COD GEN) en un desplegable como «reglas con casos»
-        zona.append(h('div', { class: 'med-repetidos' }, svgIcono('error'),
+        avisoRep.append(h('div', { class: 'med-repetidos' }, svgIcono('error'),
           h('strong', {}, `${sug.medicar_repetidos.length} códigos Medicar repetidos`), h('span', { class: 'nota' }, 'no se pueden repetir: asigne a cada COD GEN su propio código'),
           h('span', { class: 'espacio' }),
           h('details', { class: 'menu-exportar nt-reglas-menu' },
@@ -2928,8 +2997,10 @@ async function pCatalogos(c) {
               h('div', { class: 'nt-reglas-tit' }, 'Clic en un COD GEN para abrirlo y corregir su código'),
               ...sug.medicar_repetidos.map((x) => h('div', { class: 'med-rep' }, h('span', { class: 'med-rep-cod' }, x.codigo),
                 ...x.cod_gen.map((cg) => h('button', { type: 'button', class: 'menu-opcion med-rep-cg', title: `Abrir el COD GEN ${cg}`, onclick: () => abrir(cg) }, svgIcono('editar'), String(cg))))))),
-          h('button', { type: 'button', class: 'btn sec nt-reglas-btn', onclick: () => t.filtrar({ cod_gen_audifarma: todos }) }, svgIcono('buscar'), `Ver los ${todos.length} en la tabla`)));
-      }
+          h('button', { type: 'button', class: 'btn sec nt-reglas-btn', onclick: () => { filtroRep = todos; t.filtrar({ cod_gen_audifarma: todos }); } }, svgIcono('buscar'), `Ver los ${todos.length} en la tabla`)));
+      };
+      zona.append(avisoRep);
+      pintarRep();
       columnas.push({ titulo: 'Acciones', filtro: false, valor: (f) => h('button', { type: 'button', class: 'btn-icono', title: 'Editar', 'aria-label': 'Editar', onclick: () => EDITORES[k](f, sug, refrescarSug) }, svgIcono('editar')) });
       zona.append(h('div', { class: 'cat-nuevo' },
         h('button', { class: 'btn primario', onclick: () => EDITORES[k](null, sug, refrescarSug) }, svgIcono('mas'), 'Nuevo'),
@@ -3235,5 +3306,21 @@ $('#form-login').addEventListener('submit', async (ev) => {
 $('#btn-salir').addEventListener('click', async () => { olvidarFiltros(); try { const r = await api('logout', { metodo: 'POST' }); estado.csrf = r.csrf; } finally { location.hash = ''; iniciar(); } });
 $('#btn-clave').addEventListener('click', () => dialogoClave(false));
 $('#btn-menu').addEventListener('click', () => $('#menu').classList.toggle('abierto'));
+// Menú lateral plegable (pedido del usuario, 2026-11-05): solo íconos para dar más espacio a la página; se recuerda en este navegador
+{
+  const app = $('#vista-app'); const btn = $('#btn-plegar');
+  const aplicar = (plegado) => {
+    app.classList.toggle('menu-plegado', plegado);
+    btn.title = plegado ? 'Expandir menú' : 'Contraer menú'; btn.setAttribute('aria-label', btn.title); btn.setAttribute('aria-expanded', String(!plegado));
+  };
+  let guardado = false;
+  try { guardado = localStorage.getItem('menu_plegado') === '1'; } catch { /* sin almacenamiento: expandido */ }
+  aplicar(guardado);
+  btn.addEventListener('click', () => {
+    const plegado = !app.classList.contains('menu-plegado');
+    aplicar(plegado);
+    try { localStorage.setItem('menu_plegado', plegado ? '1' : '0'); } catch { /* no se recuerda */ }
+  });
+}
 window.addEventListener('hashchange', navegar);
 iniciar().catch((e) => { document.body.prepend(h('p', { class: 'error', style: 'padding:16px' }, `No se pudo iniciar: ${e.message}`)); });

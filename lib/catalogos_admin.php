@@ -180,7 +180,13 @@ function presentacion_guardar(PDO $pdo, array $in, int $usuarioId): array {
 const MOLECULA_LISTAS = [
     'pos_no_pos'  => ['POS', 'NO POS', 'ASIGNAR'],
     'cadena_frio' => ['SI', 'NO', 'NO APLICA'],
+    // Clasificación de entrega (2026-11-05): obligatoria al crear; los COD GEN que ya existían pueden quedar vacíos hasta asignarla
+    'clasificacion_entrega' => ['MTOS DE APLICACION', 'ALTO COSTO', 'AMBULATORIO'],
 ];
+/** Valor de lista comparable: mayúsculas, sin tildes ni espacios repetidos («Mtos de Aplicación» = MTOS DE APLICACION). */
+function normalizar_lista(?string $v): string {
+    return strtr(normalizar_texto($v), ['Á' => 'A', 'É' => 'E', 'Í' => 'I', 'Ó' => 'O', 'Ú' => 'U']);
+}
 
 function molecula_guardar(PDO $pdo, array $in, int $usuarioId): array {
     $id = (int) ($in['id'] ?? 0);
@@ -194,6 +200,7 @@ function molecula_guardar(PDO $pdo, array $in, int $usuarioId): array {
         'via_administracion'     => _texto_obligatorio($in, 'via_administracion', 'La vía de administración', 100),
         'pos_no_pos'             => normalizar_texto($in['pos_no_pos'] ?? ''),
         'cadena_frio'            => normalizar_texto($in['cadena_frio'] ?? ''),
+        'clasificacion_entrega'  => normalizar_lista($in['clasificacion_entrega'] ?? ''),
         'cantidad_tope'          => trim((string) ($in['cantidad_tope'] ?? '')),
         'activo'                 => !empty($in['activo']) ? 1 : 0,
         'actualizado_en'         => ahora(),
@@ -209,6 +216,11 @@ function molecula_guardar(PDO $pdo, array $in, int $usuarioId): array {
     // El código Medicar es el COD_MOLECULA del código de producto: debe ser numérico.
     if (!preg_match('/^\d{1,10}$/', $datos['codigo_medicar'])) throw new ErrorApi('El código Medicar (COD_GEN_SIESA) es obligatorio y numérico.', 422);
     foreach (MOLECULA_LISTAS as $campo => $validos) {
+        if ($campo === 'clasificacion_entrega' && $datos[$campo] === '') {
+            if (!$id) throw new ErrorApi('Asigne la clasificación de entrega: ' . implode(', ', $validos) . '.', 422);
+            $datos[$campo] = null; // COD GEN que ya existía sin clasificación: puede seguir vacío
+            continue;
+        }
         if (!in_array($datos[$campo], $validos, true)) throw new ErrorApi("Valor no permitido en $campo. Use: " . implode(', ', $validos), 422);
     }
     if ($datos['cantidad_tope'] !== '' && !preg_match('/^\d{1,6}$/', $datos['cantidad_tope'])) throw new ErrorApi('La cantidad tope debe ser un número entero.', 422);

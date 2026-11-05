@@ -33,6 +33,11 @@ const COR_CAMPOS_SIESA = [
     'ID_MUTUAL_AUX' => ['ID MUTUAL (MED-CODIGO GENERICO AUXILIAR)', 'DESCRIPCIONES', 'CODIGO GENERICO AUXILIAR'],
     'TIPO'          => ['Tipo de medicamento', 'DESCRIPCIONES', 'TIPO DE MEDICAMENTO'],
     'REGISTRO'      => ['Registro sanitario (frente a INVIMA)', 'DESCRIPCIONES', 'REGISTRO SANITARIO'],
+    // datos editados en la Maestra Tarifaria (2026-11-05): solo cuando la Maestra Tarifaria tiene un valor propio
+    'ATC'           => ['Código ATC', 'DESCRIPCIONES', 'CODIGO ATC'],
+    'FFM_RIPS'      => ['Forma farmacéutica RIPS', 'DESCRIPCIONES', 'FORMA FARMACEUTICA RIPS'],
+    'UMM_RIPS'      => ['Concentración RIPS', 'DESCRIPCIONES', 'CONCENTRACION MEDICAMENTO RIPS'],
+    'UPR_RIPS'      => ['Unidad de medida RIPS', 'DESCRIPCIONES', 'UNIDAD MEDIDA RIPS'],
 ];
 
 /** Registro sanitario comparable: sin el prefijo INVIMA, espacios, guiones ni puntos («2016 M-002562 R-2» = «2016M-002562-R2»). */
@@ -54,7 +59,8 @@ function cor_calcular_siesa(PDO $pdo): array {
     $carga = _carga_vigente($pdo, 'MAESTRO_SIESA');
     if (!$carga) throw new ErrorApi('No hay Maestro SIESA cargado en Bases de referencia.', 422);
     $mt = [];
-    foreach ($pdo->query('SELECT id, cum_facturar, contrato, cum, cod_auf, cod_mutual, iva, tipo_producto, activo FROM nt_item ORDER BY id') as $r) $mt[_u($r['cum_facturar'])][] = $r;
+    foreach ($pdo->query('SELECT id, cum_facturar, contrato, cum, cod_auf, cod_mutual, iva, tipo_producto, activo, atc_mt, registro_mt, ffm_rips_mt, umm_rips_mt, upr_rips_mt
+                          FROM nt_item ORDER BY id') as $r) $mt[_u($r['cum_facturar'])][] = $r;
     // la Maestra Tarifaria manda (2026-11-05): estado de cada PLU en la Maestra Tarifaria por línea
     $plusMt = []; $plusPend = []; $varios = [];
     foreach (nt_calcular($pdo)['filas'] as $f) {
@@ -63,7 +69,8 @@ function cor_calcular_siesa(PDO $pdo): array {
         if ((int) $f['activo'] && str_contains($f['reglas'], 'NT29')) $varios[_u($f['cum_facturar'])] = true; // CUM con NT29 sin resolver
     }
     $siesa = [];
-    $st = $pdo->prepare('SELECT item, referencia, cum, registro_sanitario, cod_gen_audifarma, id_mutual, codigo_generico_auxiliar, grupo_impositivo, estado, tipo_medicamento
+    $st = $pdo->prepare('SELECT item, referencia, cum, registro_sanitario, cod_gen_audifarma, id_mutual, codigo_generico_auxiliar, grupo_impositivo, estado, tipo_medicamento,
+                                codigo_atc, forma_farmaceutica_rips, concentracion_rips, unidad_medida_rips
                          FROM ref_siesa_item WHERE carga_id = ? AND cum IN (SELECT cum_facturar FROM nt_item) ORDER BY id');
     $st->execute([$carga]);
     foreach ($st as $r) $siesa[_u($r['cum'])][_u($r['referencia'])] = $r;
@@ -150,8 +157,19 @@ function cor_calcular_siesa(PDO $pdo): array {
                 $add('TIPO', $plu, $i['item'], $i['tipo_medicamento'], $nuevo, "Cambiar MED-TIPO DE MEDICAMENTO a $nuevo (TIPO PRODUCTO $tipo en la Maestra Tarifaria)");
             }
             $inv = $invima[$cum] ?? null;
-            if ($inv && !isset($inv['todos'][_cor_registro($i['registro_sanitario'])])) {
+            [$regMt] = $esperado('registro_mt'); // registro editado en la Maestra Tarifaria: manda sobre INVIMA
+            if ($regMt !== '') {
+                if (_cor_registro($regMt) !== _cor_registro($i['registro_sanitario']))
+                    $add('REGISTRO', $plu, $i['item'], $i['registro_sanitario'], $regMt, "Cambiar MED-REGISTRO SANITARIO a $regMt (registro de la Maestra Tarifaria)");
+            } elseif ($inv && !isset($inv['todos'][_cor_registro($i['registro_sanitario'])])) {
                 $add('REGISTRO', $plu, $i['item'], $i['registro_sanitario'], $inv['propuesto'], "Cambiar MED-REGISTRO SANITARIO a {$inv['propuesto']} (registro del CUM en INVIMA)");
+            }
+            // ATC y RIPS editados en la Maestra Tarifaria (vacío en la Maestra Tarifaria = se toma de SIESA, no se compara)
+            foreach ([['ATC', 'atc_mt', 'codigo_atc', 'MED-CODIGO ATC'], ['FFM_RIPS', 'ffm_rips_mt', 'forma_farmaceutica_rips', 'MED-FORMA FARMACEUTICA RIPS'],
+                      ['UMM_RIPS', 'umm_rips_mt', 'concentracion_rips', 'MED-CONCENTRACION MEDICAMENTO RIPS'], ['UPR_RIPS', 'upr_rips_mt', 'unidad_medida_rips', 'MED-UNIDAD MEDIDA RIPS']] as [$campo, $kMt, $kSiesa, $nombre]) {
+                [$v, $conflicto] = $esperado($kMt);
+                if ($v === '' || (!$conflicto && _u($v) === _u($i[$kSiesa]))) continue;
+                $add($campo, $plu, $i['item'], $i[$kSiesa], $v, $conflicto ? 'Las líneas de la Maestra Tarifaria no coinciden: corregir la Maestra Tarifaria primero' : "Cambiar $nombre a $v", $conflicto);
             }
         }
     }
@@ -300,7 +318,11 @@ function cor_calcular_medicar(PDO $pdo): array {
                 if (_u($m['tipo_medicamento']) !== $nuevo) $add('TIPO', $p, $m['tipo_medicamento'], $nuevo, "Cambiar el Tipo Medicamento del PLU $p a $nuevo");
             }
             $inv = $invima[$cum] ?? null;
-            if ($inv && !isset($inv['todos'][_cor_registro($m['registro_invima'])])) {
+            $regMt = trim((string) ($l['registro_mt'] ?? '')); // registro editado en la Maestra Tarifaria: manda sobre INVIMA
+            if ($regMt !== '') {
+                if (_cor_registro($regMt) !== _cor_registro($m['registro_invima']))
+                    $add('REGISTRO', $p, $m['registro_invima'], $regMt, "Cambiar el Registro Invima del PLU $p a $regMt (registro de la Maestra Tarifaria)");
+            } elseif ($inv && !isset($inv['todos'][_cor_registro($m['registro_invima'])])) {
                 $add('REGISTRO', $p, $m['registro_invima'], $inv['propuesto'], "Cambiar el Registro Invima del PLU $p a {$inv['propuesto']} (registro del CUM en INVIMA)");
             }
         }

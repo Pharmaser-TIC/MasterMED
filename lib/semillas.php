@@ -306,6 +306,10 @@ function migraciones_datos(PDO $pdo): array {
             $pdo->exec("DELETE FROM proc_resultado WHERE regla_codigo IN ('A04', 'NT17')");
             $pdo->exec("DELETE FROM proc_regla WHERE codigo IN ('A04', 'NT17')");
         }],
+        'M038_NT31_SOLO_EN_INVIMA' => ['NT31 solo aplica si el CUM está en INVIMA (pedido del usuario, 2026-11-05)', function (PDO $pdo) {
+            $pdo->prepare('UPDATE proc_regla SET descripcion = ? WHERE codigo = ?')
+                ->execute(['Maestra Tarifaria: el registro sanitario o su estado, editado en la Maestra Tarifaria, no coincide con INVIMA (si el CUM no está en INVIMA no aplica)', 'NT31']);
+        }],
         'M037_NT29_MAESTRA_TARIFARIA' => ['NT29 se valida en la Maestra Tarifaria (la MT manda; SIESA y MEDICAR son espejo): decisión del usuario, 2026-11-05', function (PDO $pdo) {
             $pdo->prepare('UPDATE proc_regla SET descripcion = ?, base_comparada = ?, accion_sugerida = ? WHERE codigo = ?')
                 ->execute(['Maestra Tarifaria: la línea tiene más de un PLU activo en la Maestra Tarifaria (no aplica a insumos 799 ni a VITAL NO DISPONIBLE)', 'Maestra Tarifaria',
@@ -559,6 +563,7 @@ function semilla_reglas(PDO $pdo): void {
         ['NT28', 'Maestra Tarifaria: el subplán de la línea no está parametrizado (sin clasificación CAPITA / EVENTO o inactivo)', 'ALERTA', 'Subplanes', 'Parametrizar el subplán en Catálogos → Subplanes Medicar'],
         ['NT27', 'Maestra Tarifaria: la línea está inactiva en SIESA y en MEDICAR', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)'],
         ['NT30', 'Maestra Tarifaria: sin PLU en SIESA ni en MEDICAR', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)'],
+        ['NT31', 'Maestra Tarifaria: el registro sanitario o su estado, editado en la Maestra Tarifaria, no coincide con INVIMA (si el CUM no está en INVIMA no aplica)', 'ALERTA', 'INVIMA', 'Confirmar el dato con INVIMA o dejar el campo vacío para tomar el de INVIMA'],
         ['NT14', 'Maestra Tarifaria: COD GEN SIESA distinto del Maestro SIESA',                 'ALERTA', 'Maestro SIESA',         'Corregir el COD GEN SIESA'],
         ['NT16', 'Maestra Tarifaria: el producto está inactivo en el contrato',                 'ALERTA', 'Contrato Evento', 'Confirmar con el contrato'],
         ['A05', 'Precio 1 con excepción aprobada',                                'ALERTA', 'Maestra Tarifaria',        'Verificar la excepción'],

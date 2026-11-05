@@ -29,6 +29,7 @@ function catalogo_excel_definicion(string $tipo): array {
             ['grupo_farmacologico',    'GRUPO FARMACOLOGICO',    'texto',  150, true],
             ['via_administracion',     'VIA DE ADMINISTRACION',  'texto',  100, true],
             ['cadena_frio',            'CADENA DE FRIO',         'lista',  10,  true],
+            ['clasificacion_entrega',  'CLASIFICACION DE ENTREGA', 'lista', 40, true], // MTOS DE APLICACION / ALTO COSTO / AMBULATORIO
             ['activo',                 'ACTIVO',                 'activo', 2,   false],
         ]],
         'laboratorio' => ['tabla' => 'cat_laboratorio', 'llave' => 'codigo', 'hoja' => 'LABORATORIOS', 'campos' => [
@@ -169,7 +170,7 @@ function catalogo_procesar_excel(PDO $pdo, string $tipo, string $ruta, string $n
                     elseif (!preg_match('/[\p{L}\p{N}]/u', $v)) $motivo = 'Valor sin letras ni números. Si el dato no aplica, escriba NO APLICA.';
                     break;
                 case 'entero': $v = codigo_excel($v); if (!preg_match('/^\d{1,' . $max . '}$/', $v)) $motivo = 'Debe ser un número entero.'; break;
-                case 'lista': $v = normalizar_texto($v); if (!in_array($v, $listas[$col], true)) $motivo = 'Valor no permitido. Use: ' . implode(', ', $listas[$col]); break;
+                case 'lista': $v = normalizar_lista($v); if (!in_array($v, $listas[$col], true)) $motivo = 'Valor no permitido. Use: ' . implode(', ', $listas[$col]); break;
                 case 'activo': $v = normalizar_texto($v); if (!in_array($v, ['SI', 'NO'], true)) $motivo = 'Use SI o NO.'; $v = $v === 'SI' ? 1 : 0; break;
                 case 'unidad_orden': $v = normalizar_texto($v); if (!preg_match('/^[A-Z0-9]{2,10}$/', $v)) $motivo = '2 a 10 letras o números, sin espacios.'; break;
                 case 'solo_crear':

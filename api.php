@@ -213,7 +213,7 @@ const PERMISOS_SOLO_ADMIN = ['BASE.ACTUALIZAR', 'CATALOGO.EDITAR', 'USUARIO.GEST
 
 // ------------------------------------------------------------------ catálogos consultables
 const CATALOGOS = [
-    'molecula'     => ['cat_molecula', 'id, cod_gen_audifarma, descripcion_general, codigo_medicar, concentracion_agrupada, principio_activo, forma_farmaceutica, grupo_farmacologico, via_administracion, pos_no_pos, cadena_frio, cantidad_tope, activo', ['cod_gen_audifarma', 'descripcion_general', 'codigo_medicar', 'principio_activo'], 'cod_gen_audifarma'],
+    'molecula'     => ['cat_molecula', 'id, cod_gen_audifarma, descripcion_general, codigo_medicar, concentracion_agrupada, principio_activo, forma_farmaceutica, grupo_farmacologico, via_administracion, pos_no_pos, cadena_frio, clasificacion_entrega, cantidad_tope, activo', ['cod_gen_audifarma', 'descripcion_general', 'codigo_medicar', 'principio_activo'], 'cod_gen_audifarma'],
     'laboratorio'  => ['cat_laboratorio', 'id, codigo, nombre, activo', ['codigo', 'nombre'], 'nombre'],
     'presentacion' => ['cat_presentacion', 'id, codigo, presentacion_agrupada, unidad_orden, activo', ['codigo', 'presentacion_agrupada', 'unidad_orden'], 'presentacion_agrupada'],
     'lista'        => ['cat_lista_valor', 'id, lista, valor, orden, activo', ['valor'], 'orden, valor'],

@@ -20,6 +20,13 @@ require_once __DIR__ . '/xlsx_writer.php';
 const NT_CAMPOS = ['cum', 'cum_facturar', 'contrato', 'fecha', 'cod_auf', 'tipo_producto', 'descripcion', 'cod_gen_siesa', 'nuevo_cod_mutual',
                    'cod_mutual', 'precio_venta', 'iva']; // COD MUTUAL FINAL eliminado (decisión del usuario, 2026-10-14)
 
+/**
+ * Datos INVIMA / RIPS propios de la Maestra Tarifaria (2026-11-05): campo de la fila => columna de nt_item => largo máximo.
+ * Vacío = se toma de SIESA (ATC y RIPS, por el PLU) o de INVIMA (registro y estado, por el CUM). Son del CUM: se guardan en todas sus líneas.
+ */
+const NT_DATOS_MT = ['atc' => ['atc_mt', 120], 'registro_sanitario' => ['registro_mt', 80], 'estado_registro' => ['estado_registro_mt', 60],
+    'ffm_rips' => ['ffm_rips_mt', 40], 'umm_rips' => ['umm_rips_mt', 40], 'upr_rips' => ['upr_rips_mt', 40]];
+
 /** Contratos de una línea de la Maestra Tarifaria. EVENTO y EVENTO SAS se validan con el Contrato Evento (decisión del usuario). */
 const NT_CONTRATOS = ['CAPITA', 'EVENTO', 'EVENTO SAS', 'CONSORCIO'];
 /**
@@ -227,7 +234,12 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
 
     $codGen = array_fill_keys(array_map('_u', $pdo->query('SELECT cod_gen_audifarma FROM cat_molecula')->fetchAll(PDO::FETCH_COLUMN)), true);
     $posNoPos = [];
-    foreach ($pdo->query('SELECT cod_gen_audifarma, pos_no_pos FROM cat_molecula') as $r) $posNoPos[_u($r['cod_gen_audifarma'])] = $r['pos_no_pos'];
+    $molCat = []; // COD GEN (moléculas) por COD AUF: descripción y COD GEN SIESA (= Cód. Medicar), que no se editan en la Maestra Tarifaria
+    foreach ($pdo->query('SELECT cod_gen_audifarma, pos_no_pos, descripcion_general, codigo_medicar, clasificacion_entrega FROM cat_molecula') as $r) {
+        $posNoPos[_u($r['cod_gen_audifarma'])] = $r['pos_no_pos'];
+        $molCat[_u($r['cod_gen_audifarma'])] = [mb_strtoupper(trim((string) $r['descripcion_general'])) ?: null, trim((string) $r['codigo_medicar']) ?: null,
+            trim((string) $r['clasificacion_entrega']) ?: null];
+    }
     // Catálogo de subplanes: clasificación CAPITA / EVENTO (fase 7D)
     $subplanCat = [];
     foreach ($pdo->query('SELECT nombre, clasificacion, fuente, activo FROM cat_subplan') as $r) $subplanCat[_u($r['nombre'])] = $r;
@@ -455,6 +467,18 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
                     }
                 }
             }
+            // registro / estado editados en la Maestra Tarifaria: alerta solo si el CUM está en INVIMA y no coinciden (NT11 / NT24 siguen
+            // con INVIMA). Si el CUM no está en INVIMA no es alerta: el usuario está completando el dato (pedido del usuario, 2026-11-05)
+            $invR = $invima[$d] ?? null;
+            if ($invR && (($it['registro_mt'] ?? null) !== null || ($it['estado_registro_mt'] ?? null) !== null)) {
+                $reg = fn($v) => preg_replace('/[^A-Z0-9]/', '', preg_replace('/^\s*INVIMA\s*/', '', _u($v)));
+                $dif = [];
+                if (($it['registro_mt'] ?? null) !== null && $reg($it['registro_mt']) !== $reg($invR['registro_sanitario']))
+                    $dif[] = "registro {$it['registro_mt']} (INVIMA: {$invR['registro_sanitario']})";
+                if (($it['estado_registro_mt'] ?? null) !== null && _u($it['estado_registro_mt']) !== _u($invR['estado_registro']))
+                    $dif[] = "estado {$it['estado_registro_mt']} (INVIMA: {$invR['estado_registro']})";
+                if ($dif) $motivo('NT31', 'ALERTA', 'Dato editado en la Maestra Tarifaria distinto de INVIMA: ' . implode('; ', $dif));
+            }
             $grupo = $siesa[$d]['grupo'] ?? null;
             if ($grupo !== null && isset($ivaGrupo[$grupo]) && abs($ivaGrupo[$grupo] - (float) $it['iva']) > 0.001) {
                 $motivo('NT12', 'ALERTA', sprintf('IVA %s%% y SIESA tiene grupo %s (%s%%)', (float) $it['iva'] * 100, $grupo, $ivaGrupo[$grupo] * 100));
@@ -507,8 +531,25 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
         $niveles = array_column($m, 'nivel');
         $estado = !(int) $it['activo'] ? 'INACTIVO' : (in_array('ERROR', $niveles, true) ? 'ERROR' : ($niveles ? 'CON ALERTA' : 'VALIDADO'));
 
-        $fila = array_intersect_key($it, array_flip([...NT_CAMPOS, 'id', 'activo', 'origen_precio', 'actualizado_en', 'precio1_aprobado_en', 'cum_validado_en', 'precio_aplica', 'precio_digitado', 'fuente_precio']));
+        $fila = array_intersect_key($it, array_flip([...NT_CAMPOS, 'id', 'activo', 'origen_precio', 'actualizado_en', 'precio1_aprobado_en', 'cum_validado_en', 'precio_aplica', 'precio_digitado', 'fuente_precio',
+            ...array_column(NT_DATOS_MT, 0)]));
         $porPlu = $siesaLinea['_por_plu'];
+        // datos INVIMA / RIPS (2026-11-05): los de la Maestra Tarifaria mandan; vacío = SIESA (ATC, RIPS) o INVIMA (registro y estado)
+        $invL = $invima[$d] ?? null;
+        $fuenteDatos = ['atc' => $siesaLinea['atc'], 'ffm_rips' => $siesaLinea['ffm_rips'], 'umm_rips' => $siesaLinea['umm_rips'], 'upr_rips' => $siesaLinea['upr_rips'],
+            'registro_sanitario' => $invL ? (trim((string) $invL['registro_sanitario']) ?: null) : null, 'estado_registro' => $invL ? (trim((string) $invL['estado_registro']) ?: null) : null];
+        $siesaLinea['registro_sanitario'] = $fuenteDatos['registro_sanitario'];
+        $siesaLinea['estado_registro'] = $fuenteDatos['estado_registro'];
+        foreach (NT_DATOS_MT as $kd => [$col]) if (($it[$col] ?? null) !== null) { // $kd: $k es el contrato de la línea
+            $siesaLinea[$kd] = $it[$col];
+            foreach ($porPlu as &$x) $x[$kd] = $it[$col];
+            unset($x);
+        }
+        $siesaLinea['datos_fuente'] = $fuenteDatos;
+        $siesaLinea['descripcion_catalogo'] = $molCat[$e][0] ?? null;
+        $siesaLinea['cod_gen_catalogo'] = $molCat[$e][1] ?? null;
+        // clasificación de entrega: del catálogo COD GEN por el COD AUF (no se valida con SIESA ni MEDICAR)
+        $siesaLinea['clasificacion_entrega'] = $molCat[$e][2] ?? null;
         // Un PLU por fila; el activar / inactivar es por PLU + CONTRATO: el PLU inactivo de una línea activa sale INACTIVO en su fila,
         // sin reglas (la línea se sigue validando con sus demás PLU)
         if (count($porPlu) > 1) foreach ($porPlu as $plu => &$x) {
@@ -697,7 +738,7 @@ function _nt_medicar(array $plus, string $cum, array $subplanes, array $medPlu, 
 }
 
 /** Columnas de la Maestra Tarifaria que se pueden filtrar. */
-const NT_FILTRABLES = ['contrato_vista', 'cum', 'cum_facturar', 'fecha', 'cod_auf', 'tipo_producto', 'descripcion', 'cod_gen_siesa', 'cod_mutual',
+const NT_FILTRABLES = ['contrato_vista', 'cum', 'cum_facturar', 'fecha', 'cod_auf', 'tipo_producto', 'clasificacion_entrega', 'descripcion', 'cod_gen_siesa', 'cod_mutual',
     'referencia_siesa', 'descripcion_siesa', 'atc', 'ffm_rips', 'umm_rips', 'upr_rips', 'medicar', 'plu_medicar', 'subplan', 'clasificacion',
     'precio_venta', 'iva', 'contrato', 'en_contrato', 'precio_correcto', 'cum_codigo', 'estado', 'reglas',
     'precio_final', 'precio_contrato', 'precio_maximo', 'precio_regulado', 'cumple_regulado', 'tarifa_capita', 'precio_capita_ok', 'activo_estado'];
@@ -1289,16 +1330,64 @@ function nt_guardar(PDO $pdo, array $d, int $usuarioId): array {
         $datos['activo'] = !empty($d['activo']) ? 1 : 0;
         if ((string) $antes['precio_venta'] !== (string) $datos['precio_venta'] && $datos['precio_venta'] !== null
             && abs((float) $antes['precio_venta'] - (float) $datos['precio_venta']) > 0.001) $datos['origen_precio'] = 'MANUAL';
-        $cambios = array_filter($datos, fn($v, $k) => (string) $antes[$k] !== (string) $v
-            && !(is_numeric($antes[$k]) && is_numeric($v) && abs((float) $antes[$k] - (float) $v) < 0.001), ARRAY_FILTER_USE_BOTH);
+        // Vista de edición (pedido del usuario, 2026-11-05): COD AUF no se edita; DESCRIPCION y COD GEN SIESA salen del catálogo
+        // COD GEN (moléculas) por el COD AUF (si el COD AUF no está en el catálogo, se conservan)
+        $datos['cod_auf'] = $antes['cod_auf'];
+        $st = $pdo->prepare('SELECT descripcion_general, codigo_medicar FROM cat_molecula WHERE UPPER(cod_gen_audifarma) = ?');
+        $st->execute([_u((string) $antes['cod_auf'])]);
+        $mol = $st->fetch();
+        $datos['descripcion'] = $mol ? (mb_strtoupper(trim(preg_replace('/\s+/u', ' ', (string) $mol['descripcion_general']))) ?: $antes['descripcion']) : $antes['descripcion'];
+        $datos['cod_gen_siesa'] = $mol ? (trim((string) $mol['codigo_medicar']) ?: $antes['cod_gen_siesa']) : $antes['cod_gen_siesa'];
+        // datos INVIMA / RIPS propios de la Maestra Tarifaria (vacío = el de SIESA / INVIMA)
+        if (is_array($d['datos_mt'] ?? null)) foreach (NT_DATOS_MT as $k => [$col, $largo]) {
+            if (!array_key_exists($k, $d['datos_mt'])) continue;
+            $v = trim(preg_replace('/\s+/u', ' ', (string) $d['datos_mt'][$k]));
+            $datos[$col] = $v === '' ? null : mb_substr(mb_strtoupper($v), 0, $largo);
+        }
+        // CUM a facturar (la llave): se cambia en todas las líneas del CUM (todos los contratos), si el nuevo no existe ya
+        $viejoCf = (string) $antes['cum_facturar'];
+        $nuevoCf = _u(trim(preg_replace('/\s+/u', ' ', (string) ($d['cum_facturar'] ?? ''))));
+        $renombrar = $nuevoCf !== '' && $nuevoCf !== _u($viejoCf);
+        if ($renombrar) {
+            if (mb_strlen($nuevoCf) > 60) throw new ErrorApi('El CUM a facturar admite máximo 60 caracteres.', 422);
+            $st = $pdo->prepare('SELECT contrato FROM nt_item WHERE UPPER(cum_facturar) = ?');
+            $st->execute([$nuevoCf]);
+            if ($ya = $st->fetchAll(PDO::FETCH_COLUMN))
+                throw new ErrorApi("El CUM a facturar $nuevoCf ya existe en la Maestra Tarifaria (" . implode(', ', array_map('nt_contrato_vista', $ya)) . '): no se puede cambiar a ese.', 409);
+            $datos['cum_facturar'] = $nuevoCf;
+        }
+        $difiere = fn(array $fila, array $nuevos) => array_filter($nuevos, fn($v, $k) => (string) $fila[$k] !== (string) $v
+            && !(is_numeric($fila[$k]) && is_numeric($v) && abs((float) $fila[$k] - (float) $v) < 0.001), ARRAY_FILTER_USE_BOTH);
+        $cambios = $difiere($antes, $datos);
         if (!$cambios) return ['id' => $id, 'cambios' => 0];
         if (array_key_exists('precio_venta', $cambios) && $antes['precio1_aprobado_en']) $cambios += ['precio1_aprobado_por' => null, 'precio1_aprobado_en' => null];
-        $sets = implode(', ', array_map(fn($k) => "$k = ?", array_keys($cambios)));
-        $pdo->prepare("UPDATE nt_item SET $sets, actualizado_en = ?, actualizado_por = ? WHERE id = ?")
-            ->execute([...array_values($cambios), ahora(), $usuarioId, $id]);
+        $actualizar = function (int $idF, array $c) use ($pdo, $usuarioId) {
+            $sets = implode(', ', array_map(fn($k) => "$k = ?", array_keys($c)));
+            $pdo->prepare("UPDATE nt_item SET $sets, actualizado_en = ?, actualizado_por = ? WHERE id = ?")->execute([...array_values($c), ahora(), $usuarioId, $idF]);
+        };
+        $actualizar($id, $cambios);
         // la línea completa: sus PLU conservan su estado en la Maestra Tarifaria (al reactivarla sin ningún PLU activo se toman los de SIESA)
         auditar($usuarioId, 'NT_EDITAR', 'nt_item', $id, array_intersect_key($antes, $cambios), $cambios);
-        return ['id' => $id, 'cambios' => count($cambios)];
+        $total = count($cambios);
+        // los datos del producto (CUM a facturar, CUM, registro, ATC, RIPS) son del CUM: se aplican en todas sus líneas (todos los contratos)
+        $delCum = array_intersect_key($datos, array_flip(['cum', 'cum_facturar', ...array_column(NT_DATOS_MT, 0)]));
+        $st = $pdo->prepare('SELECT * FROM nt_item WHERE cum_facturar = ? AND id <> ?');
+        $st->execute([$viejoCf, $id]);
+        $ids = [$id];
+        foreach ($st->fetchAll() as $o) {
+            $ids[] = (int) $o['id'];
+            $c2 = $difiere($o, array_intersect_key($delCum, $cambios));
+            if (!$c2) continue;
+            $actualizar((int) $o['id'], $c2);
+            auditar($usuarioId, 'NT_EDITAR', 'nt_item', (int) $o['id'], array_intersect_key($o, $c2), $c2 + ['motivo' => "Desde la línea {$antes['contrato']} del CUM $viejoCf"]);
+            $total += count($c2);
+        }
+        if ($renombrar) {
+            // los PLU del CUM viejo ya no son de la línea: se toman los del nuevo CUM en SIESA; la aprobación de varios PLU pasa al nuevo
+            $pdo->prepare('DELETE FROM nt_item_plu WHERE nt_item_id IN (' . implode(',', array_fill(0, count($ids), '?')) . ')')->execute($ids);
+            $pdo->prepare('UPDATE cor_aprobacion SET cum_facturar = ? WHERE cum_facturar = ?')->execute([$nuevoCf, $viejoCf]);
+        }
+        return ['id' => $id, 'cambios' => $total, 'lineas' => count($ids), 'renombrado' => $renombrar ? $nuevoCf : null];
     }
     // Nuevo producto: el COD AUF debe existir en COD GEN (moléculas); lo que no se digitó se completa solo.
     if (!$datos['cod_auf']) throw new ErrorApi('El COD AUF es obligatorio.', 422);
@@ -1549,7 +1638,7 @@ function nt_exportar(PDO $pdo, string $destino, array $filtros = [], bool $soloE
     $enc = ['FECHA DE CREACION', 'CONTRATO', 'SUBPLAN', 'CUM', 'CUM FACTURAR', 'COD AUF', 'TIPO PRODUCTO', 'DESCRIPCION', 'COD GEN SIESA',
             'PLU', 'DESCRIPCION COMPLETA', 'ATC', 'COD MUTUAL', "PRECIO DE VENTA $anio", 'IVA', 'PRECIO FINAL + IVA', '¿ESTA EN EL CONTRATO?',
             'PRECIO CONTRATO', '¿PRECIO CORRECTO - M?', 'PRECIO REGULADO', 'FORMA FARMACEUTICA RIPS', 'CONCENTRACION RIPS', 'UNIDAD MEDIDA RIPS',
-            'OBSERVACIONES', 'ESTADO'];
+            'CLASIFICACION DE ENTREGA', 'OBSERVACIONES', 'ESTADO'];
     if ($soloErrores) $enc[] = 'CÓMO CORREGIR';
     $accion = $pdo->query("SELECT codigo, accion_sugerida FROM proc_regla WHERE codigo LIKE 'NT%'")->fetchAll(PDO::FETCH_KEY_PAIR);
     $num = fn($v) => $v === null || $v === '' ? null : (float) $v;
@@ -1561,7 +1650,7 @@ function nt_exportar(PDO $pdo, string $destino, array $filtros = [], bool $soloE
                    $f['cod_gen_siesa_calc'], $f['referencia_siesa'], $f['descripcion_siesa'], $f['atc'], $f['cod_mutual'],
                    $num($f['precio_venta']), $num($f['iva']), $num($f['precio_final']), $f['en_contrato'],
                    $f['precio_contrato'] === null ? ($f['contrato'] === 'CAPITA' ? 'NO ESTA EN EL LISTADO CAPITA' : 'NO ESTA EN EL CONTRATO') : $num($f['precio_contrato']),
-                   $num($f['precio_maximo']), $num($f['precio_regulado']), $f['ffm_rips'], $f['umm_rips'], $f['upr_rips'],
+                   $num($f['precio_maximo']), $num($f['precio_regulado']), $f['ffm_rips'], $f['umm_rips'], $f['upr_rips'], $f['clasificacion_entrega'],
                    implode(' · ', array_map(fn($m) => "{$m['codigo']}: {$m['texto']}", $f['motivos'])), $f['estado'],
                    ...($soloErrores ? [implode(' · ', array_unique(array_map(fn($m) => "{$m['codigo']}: " . ($accion[$m['codigo']] ?? ''), $f['motivos'])))] : [])];
         }

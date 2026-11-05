@@ -807,3 +807,25 @@ dialog.ancho-nt { width: min(980px, calc(100vw - 32px)); }
 .base-plantilla { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .filtro-agregar { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 2px; border-bottom: 1px solid var(--borde); color: var(--primario-osc); font-weight: 600; }
 .filtro-agregar[hidden] { display: none; }
+/* vista de edición de la Maestra Tarifaria (2026-11-05): aviso al cambiar el CUM a facturar */
+.editar-mt .nota.aviso { color: var(--alerta); font-weight: 600; }
+.editar-mt .rejilla-form .ancho-resto { grid-column: span 4; }
+@media (max-width: 900px) { .editar-mt .rejilla-form .ancho-resto { grid-column: 1 / -1; } }
+.editar-mt .nota[hidden] { display: none; }
+/* Menú lateral plegable (2026-11-05): botón junto al logo; plegado deja solo los íconos (el nombre sale al pasar el mouse) */
+.menu-cab { display: flex; align-items: flex-start; gap: 6px; }
+.menu-cab .marca-app { flex: 1; min-width: 0; }
+.menu-plegar { flex: none; width: 28px; height: 28px; border-radius: 6px; border: 1px solid rgba(255,255,255,.2); background: rgba(255,255,255,.06); color: var(--menu-texto); cursor: pointer; display: grid; place-items: center; padding: 0; }
+.menu-plegar:hover { background: rgba(255,255,255,.16); color: #fff; }
+.menu-plegar svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; transition: transform .2s; }
+.app { transition: grid-template-columns .2s; }
+@media (min-width: 901px) {
+  .app.menu-plegado { grid-template-columns: 60px 1fr; }
+  .app.menu-plegado .menu { padding: 12px 8px; }
+  .app.menu-plegado .menu-cab { justify-content: center; }
+  .app.menu-plegado .menu-cab .marca-app, .app.menu-plegado .nav-txt, .app.menu-plegado .menu .pronto, .app.menu-plegado .menu-pie { display: none; }
+  .app.menu-plegado .menu-plegar svg { transform: rotate(180deg); }
+  .app.menu-plegado .menu .grupo { font-size: 0; height: 1px; margin: 8px 4px; background: rgba(255,255,255,.15); opacity: 1; }
+  .app.menu-plegado .menu a { justify-content: center; padding: 9px 0; }
+}
+@media (max-width: 900px) { .menu-plegar { display: none; } }

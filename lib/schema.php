@@ -763,6 +763,16 @@ function esquema_columnas_nuevas(): array {
         // CUM no encontrado en INVIMA validado a mano por el Administrador (NT10 deja de salir)
         ['nt_item',                 'cum_validado_por',     'INT NULL'],
         ['nt_item',                 'cum_validado_en',      'DATETIME NULL'],
+        // Datos INVIMA / RIPS propios de la Maestra Tarifaria, editables por el Administrador (2026-11-05). Vacío = el de SIESA / INVIMA.
+        // La Maestra Tarifaria manda: si no coinciden con SIESA salen en Inconsistencias; si no coinciden con INVIMA, alerta NT31.
+        // Clasificación de entrega del COD GEN (pedido del usuario, 2026-11-05): alimenta la Maestra Tarifaria por COD AUF; no se valida con SIESA ni MEDICAR
+        ['cat_molecula',            'clasificacion_entrega', 'VARCHAR(40) NULL'],
+        ['nt_item',                 'atc_mt',               'VARCHAR(120) NULL'],
+        ['nt_item',                 'registro_mt',          'VARCHAR(80) NULL'],
+        ['nt_item',                 'estado_registro_mt',   'VARCHAR(60) NULL'],
+        ['nt_item',                 'ffm_rips_mt',          'VARCHAR(40) NULL'],
+        ['nt_item',                 'umm_rips_mt',          'VARCHAR(40) NULL'],
+        ['nt_item',                 'upr_rips_mt',          'VARCHAR(40) NULL'],
         // NT: subplán leído del Excel (CONTRATO EVENTO + subplán SAS = línea EVENTO SAS), 2026-10-14
         ['ref_nt_item',             'subplan_archivo',         'VARCHAR(60) NULL'],
         ['ref_nt_item',             'plu_archivo',             'VARCHAR(60) NULL'], // un PLU por fila en el Excel (2026-10-19)
