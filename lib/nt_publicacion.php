@@ -26,7 +26,7 @@ function requerir_llave_publicacion(): void {
 }
 
 /** Tablas cuyo contenido completo determina el resultado de nt_calcular(). */
-const NT_VERSION_TABLAS = ['nt_item', 'nt_item_plu', 'cat_molecula', 'cat_subplan', 'cat_grupo_impositivo', 'proc_regla'];
+const NT_VERSION_TABLAS = ['nt_item', 'nt_item_plu', 'cor_aprobacion', 'cat_molecula', 'cat_subplan', 'cat_grupo_impositivo', 'proc_regla'];
 
 /** Bases de referencia que lee nt_calcular(): se usa la carga vigente de cada una. */
 const NT_VERSION_CARGAS = ['CONTRATO_EVENTO_22382', 'LISTADO_CAPITA', 'LISTADO_EVENTO_SAS', 'INVIMA', 'MAESTRO_SIESA',

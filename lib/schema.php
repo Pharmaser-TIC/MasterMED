@@ -580,6 +580,19 @@ function esquema_tablas(): array {
             exportado_en DATETIME NULL,
             exportado_por INT NULL,
             cerrado_en DATETIME NULL",
+        // CUM que sí deben tener varios PLU activos en SIESA, revisados y aprobados (pedido del usuario, 2026-11-05): no generan
+        // «Más de un PLU con el mismo CUM» ni NT29 mientras sus PLU activos sean los aprobados (si SIESA activa otro, vuelve el error).
+        'cor_aprobacion' => "
+            id {PK},
+            cum_facturar VARCHAR(60) NOT NULL,
+            campo VARCHAR(30) NOT NULL,
+            plus VARCHAR(500) NOT NULL,
+            motivo VARCHAR(300) NOT NULL,
+            activo TINYINT NOT NULL DEFAULT 1,
+            aprobado_por INT NULL,
+            aprobado_en DATETIME NOT NULL,
+            retirado_por INT NULL,
+            retirado_en DATETIME NULL",
         'cor_revision' => "
             id {PK},
             sistema VARCHAR(10) NOT NULL,
@@ -689,6 +702,7 @@ function esquema_indices(): array {
         ['idx_ntc_item',      'nt_precio_calculo', 'nt_item_id'],
         ['idx_ntq_linea',     'nt_quitada',        'cum_facturar, contrato'],
         ['idx_ntp_item',      'nt_item_plu',       'nt_item_id, plu'],
+        ['idx_cora_cum',      'cor_aprobacion',    'cum_facturar, campo'],
         ['idx_rcc_carga',     'ref_carga_cambio',  'carga_id'],
         ['idx_cor_estado',    'cor_inconsistencia','sistema, estado'],
         ['idx_cor_llave',     'cor_inconsistencia','llave'],

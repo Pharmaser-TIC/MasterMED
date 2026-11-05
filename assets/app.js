@@ -2569,8 +2569,9 @@ function pintarLista(zona, lista, editable, alCambiar) {
 const COR_ESTADO = {
   NO_VALIDADO: ['No validado', 'error', 'error'], PENDIENTE_CORRECCION: ['Por corregir', 'alerta', 'alerta'],
   PENDIENTE_REVISION: ['Pendiente de revisión', 'info', 'pendiente'], PENDIENTE_ACTUALIZACION: ['Pendiente de actualización', 'gris', 'reloj'],
-  CORREGIDO: ['Corregido', 'ok', 'ok'],
+  CORREGIDO: ['Corregido', 'ok', 'ok'], APROBADO: ['Aprobado', 'ok', 'ok'],
 };
+const COR_CERRADOS = ['CORREGIDO', 'APROBADO'];
 const COR_CARGUE = { DESCRIPCIONES: 'Descripciones Técnicas', CREACION_ITEM: 'CREACION_ITEM', MANUAL: 'A mano', OBSERVACION: 'PLU + observación' };
 const COR_BASE = { SIESA: 'Maestro SIESA', MEDICAR: 'Maestra MEDICAR' };
 
@@ -2617,7 +2618,7 @@ async function pCorrecciones(c) {
     } catch (e) { toast(e.message, true); }
   };
   const pintarResumen = (rs) => {
-    const abiertas = Object.entries(rs.estados).filter(([k]) => k !== 'CORREGIDO').reduce((a, [, n]) => a + n, 0);
+    const abiertas = Object.entries(rs.estados).filter(([k]) => !COR_CERRADOS.includes(k)).reduce((a, [, n]) => a + n, 0);
     const rev = rs.revision;
     const desactualizada = rev && Number(rev.carga_id) !== Number(rs.carga_vigente);
     const item = (k) => (rs.estados[k] ? h('button', { type: 'button', class: `nt-res-item r-${COR_ESTADO[k][1] === 'info' ? 'gris' : COR_ESTADO[k][1]}`, title: 'Ver solo estos',
@@ -2626,6 +2627,8 @@ async function pCorrecciones(c) {
       h('span', { class: `nota cor-revision${desactualizada ? ' cor-desact' : ''}` }, rev ? `Revisado ${fecha(rev.creado_en)} · ${COR_BASE[sistema]} v${rev.version ?? '—'}${desactualizada ? ' (hay una versión más nueva: revise de nuevo)' : ''}` : 'Aún no se ha revisado'),
       gestionar ? h('button', { class: 'btn sec', onclick: (ev) => revisar(ev.currentTarget) }, svgIcono('recargar'), 'Revisar ahora') : null,
       gestionar ? h('button', { class: 'btn sec', onclick: () => descargasCorrecciones(sistema) }, svgIcono('carpeta'), 'Descargas') : null,
+      esMed ? null : h('button', { class: 'btn sec', title: 'CUM revisados que sí deben tener varios PLU activos', onclick: () => aprobacionesVariosPlu(gestionar, () => tabla.refrescar()) },
+        svgIcono('ok'), 'Varios PLU aprobados'),
       gestionar ? h('button', { class: 'btn primario', disabled: !rs.exportables, onclick: () => descargar(rs.exportables),
         title: rs.exportables ? 'Descarga los archivos de cargue con lo pendiente (respeta los filtros de la tabla)' : 'No hay correcciones pendientes por descargar' },
       svgIcono('bajar'), `${esMed ? 'Archivo PLU + observación' : 'Archivos de cargue'} (${miles(rs.exportables)})`) : null,
@@ -2640,7 +2643,7 @@ async function pCorrecciones(c) {
     resumen.replaceChildren(h('div', { class: 'tarjeta nt-resumen' },
       h('button', { type: 'button', class: 'nt-res-total cor-total', title: 'Ver todo lo pendiente', onclick: () => filtrarPor({}) },
         h('span', { class: 'nt-res-ico reglas-ico' }, icono('correcciones')), h('strong', {}, miles(abiertas)), h('span', {}, `por corregir en ${sistema}`)),
-      ...['NO_VALIDADO', 'PENDIENTE_REVISION', 'PENDIENTE_ACTUALIZACION', 'CORREGIDO'].map(item).filter(Boolean),
+      ...['NO_VALIDADO', 'PENDIENTE_REVISION', 'PENDIENTE_ACTUALIZACION', 'CORREGIDO', 'APROBADO'].map(item).filter(Boolean),
       h('span', { class: 'espacio' }), ...derecha,
       menuCampos ? h('div', { class: 'cor-menu-fila' }, menuCampos) : null));
   };
@@ -2660,8 +2663,54 @@ async function pCorrecciones(c) {
       esMed ? null : { campo: 'cargue', titulo: 'Se carga con', filtro: { campo: 'cargue', opciones: Object.entries(COR_CARGUE) }, valor: (f) => COR_CARGUE[f.cargue] || f.cargue },
       { campo: 'detectado_en', titulo: 'Detectado', valor: (f) => fecha(f.detectado_en) },
       { campo: 'exportado_en', titulo: 'Descargado', valor: (f) => (f.exportado_en ? fecha(f.exportado_en) : '') },
+      // CUM que sí debe tener varios PLU: se aprueba y deja de salir como «por corregir» (2026-11-05)
+      gestionar && !esMed ? { titulo: 'Acciones', filtro: false, valor: (f) => (f.campo === 'PLU_VARIOS' && !COR_CERRADOS.includes(f.estado)
+        ? h('button', { type: 'button', class: 'btn sec chico', title: 'Este CUM sí debe tener varios PLU: aprobarlo como revisado', onclick: () => aprobarVariosPlu(f, () => tabla.refrescar()) },
+          svgIcono('ok'), 'Aprobar') : '') } : null,
     ].filter(Boolean) });
   t.onmouseover = (ev) => { const td = ev.target.closest?.('.tabla-datos td'); if (td && !td.title && td.scrollWidth > td.clientWidth) td.title = td.textContent; };
+}
+
+/** Aprueba que un CUM tenga varios PLU activos en SIESA: sus «Más de un PLU con el mismo CUM» pasan a «Aprobado». */
+function aprobarVariosPlu(f, alGuardar) {
+  dialogo({
+    titulo: `Aprobar varios PLU del CUM ${f.cum_facturar}`,
+    texto: `El CUM queda revisado: sus PLU activos en SIESA (${f.valor_esperado?.split(':')[0] || 'los de hoy'}) se aceptan y deja de salir «Más de un PLU con el mismo CUM» `
+      + '(y NT29 en la Maestra Tarifaria). Si después SIESA activa otro PLU con este CUM, el error vuelve a salir. Queda en auditoría y se puede retirar.',
+    campos: [{ nombre: 'motivo', etiqueta: 'Motivo', requerido: true, placeholder: 'Ej.: dos presentaciones del mismo CUM, ambas vigentes' }],
+    aceptar: 'Aprobar',
+    alEnviar: async (v) => {
+      const r = await api('cor_aprobar', { metodo: 'POST', datos: { cum_facturar: f.cum_facturar, motivo: v.motivo } });
+      toast(`CUM ${f.cum_facturar} aprobado con ${r.plus.length} PLU (${r.plus.join(', ')}).`);
+      alGuardar();
+    },
+  });
+}
+
+/** CUM aprobados con varios PLU (se puede retirar la aprobación). */
+async function aprobacionesVariosPlu(gestionar, alCambiar) {
+  const r = await api('cor_aprobaciones');
+  const dlg = $('#dialogo'); const form = $('#dialogo-form');
+  dlg.onclose = null; dlg.oncancel = null;
+  const quitar = async (x) => {
+    if (!await confirmar('Retirar aprobación', `El CUM ${x.cum_facturar} vuelve a revisarse: si sigue con varios PLU activos en SIESA, sale otra vez «Más de un PLU con el mismo CUM».`, 'Retirar')) return;
+    await api('cor_aprobacion_quitar', { metodo: 'POST', datos: { id: x.id } });
+    toast('Aprobación retirada.'); dlg.close(); alCambiar();
+  };
+  const filas = r.aprobaciones.map((x) => h('tr', {}, h('td', {}, x.cum_facturar), h('td', {}, x.plus.split(',').join(', ')), h('td', {}, x.motivo),
+    h('td', {}, x.usuario ?? ''), h('td', {}, fecha(x.aprobado_en)),
+    h('td', {}, gestionar ? h('button', { type: 'button', class: 'btn sec chico btn-peligro', onclick: () => quitar(x) }, 'Retirar') : '')));
+  form.replaceChildren(
+    h('div', { class: 'form-encabezado' }, h('h2', {}, 'CUM aprobados con varios PLU'),
+      h('button', { type: 'button', class: 'btn-icono cerrar-x', title: 'Cerrar (Esc)', 'aria-label': 'Cerrar', onclick: () => dlg.close() }, '✕')),
+    r.aprobaciones.length ? tablaConFiltros(['CUM FACTURAR', 'PLU aprobados', 'Motivo', 'Aprobó', 'Fecha', ''], filas, { sinFiltro: [5], alto: 420 })
+      : h('p', { class: 'nota' }, 'Aún no hay CUM aprobados con varios PLU. Se aprueban desde la fila «Más de un PLU con el mismo CUM» (botón Aprobar).'));
+  form.onsubmit = () => {};
+  dlg.classList.add('ancho');
+  const fuera = (ev) => { if (ev.target === dlg) dlg.close(); };
+  dlg.addEventListener('click', fuera);
+  dlg.addEventListener('close', () => { dlg.removeEventListener('click', fuera); if (!dlg.open) dlg.classList.remove('ancho'); }, { once: true });
+  if (!dlg.open) dlg.showModal();
 }
 
 /** Descargas de archivos de corrección ya hechas (se pueden volver a bajar). */

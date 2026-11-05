@@ -960,7 +960,7 @@ $acciones = [
         array_unshift($cond, 'sistema = ?'); array_unshift($params, $sistema);
         // lo corregido se conserva (trazabilidad) pero no se ve con lo pendiente: solo filtrando por el estado Corregido
         $filtros = json_decode((string) ($_GET['filtros'] ?? '{}'), true);
-        if ($campo !== 'estado' && empty($filtros['estado'])) $cond[] = "estado <> 'CORREGIDO'";
+        if ($campo !== 'estado' && empty($filtros['estado'])) $cond[] = "estado NOT IN ('CORREGIDO', 'APROBADO')"; // cerrados: solo filtrando por su estado
         if (!ver_precios($u)) $cond[] = "campo <> 'PRECIO'"; // el precio de MEDICAR solo con PRECIO.VER
         if ($campo !== null) return valores_columna('cor_inconsistencia', $cols[$campo], $cond, $params);
         $pag = max(1, (int) ($_GET['pagina'] ?? 1));
@@ -979,6 +979,20 @@ $acciones = [
     'cor_revisar' => ['POST', function () {
         $u = requerir_permiso('CORRECCION.GESTIONAR');
         return transaccion(fn() => cor_revisar(db(), cor_sistema((string) (entrada()['sistema'] ?? '')), $u['id']));
+    }],
+    // CUM que sí deben tener varios PLU activos en SIESA (2026-11-05)
+    'cor_aprobar' => ['POST', function () {
+        $u = requerir_permiso('CORRECCION.GESTIONAR');
+        $in = entrada();
+        return transaccion(fn() => cor_aprobar_varios(db(), (string) ($in['cum_facturar'] ?? ''), (string) ($in['motivo'] ?? ''), $u['id']));
+    }],
+    'cor_aprobacion_quitar' => ['POST', function () {
+        $u = requerir_permiso('CORRECCION.GESTIONAR');
+        return transaccion(fn() => cor_quitar_aprobacion(db(), (int) (entrada()['id'] ?? 0), $u['id']));
+    }],
+    'cor_aprobaciones' => ['GET', function () {
+        requerir_permiso('CORRECCION.CONSULTAR');
+        return ['aprobaciones' => cor_aprobaciones(db())];
     }],
     'cor_exportar' => ['POST', function () {
         $u = requerir_permiso('CORRECCION.GESTIONAR');

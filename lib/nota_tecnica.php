@@ -98,6 +98,21 @@ function _u(?string $v): string { return mb_strtoupper(trim((string) $v)); }
  */
 function _nt_peso(float $v): float { return floor($v + 1e-6); }
 
+/** CUM aprobados con varios PLU activos (2026-11-05): [CUM FACTURAR => [PLU aprobados]]. */
+function nt_plu_varios_aprobados(PDO $pdo): array {
+    $r = [];
+    foreach ($pdo->query("SELECT cum_facturar, plus FROM cor_aprobacion WHERE campo = 'PLU_VARIOS' AND activo = 1 ORDER BY id") as $x) {
+        $r[_u($x['cum_facturar'])] = array_values(array_filter(array_map('_u', explode(',', (string) $x['plus']))));
+    }
+    return $r;
+}
+
+/** ¿Los PLU activos de un CUM son los que se aprobaron? (si SIESA activa otro PLU, vuelve a ser error) */
+function nt_plu_varios_ok(array $aprobados, string $cumFacturar, array $plusActivos): bool {
+    $ap = $aprobados[_u($cumFacturar)] ?? null;
+    return $ap !== null && count($plusActivos) > 1 && !array_diff(array_map('_u', $plusActivos), $ap);
+}
+
 /** PLU inactivos en una línea activa (estado por PLU + CONTRATO, 2026-10-26): [id de la línea => [PLU => true]]. */
 function nt_plus_inactivos(PDO $pdo): array {
     $r = [];
@@ -243,6 +258,7 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
 
     $inactivasNt = reglas_inactivas($pdo);                // una regla inactiva no se aplica
     $plusInactivos = nt_plus_inactivos($pdo);              // estado por PLU + CONTRATO
+    $variosAprobados = nt_plu_varios_aprobados($pdo);       // CUM aprobados con varios PLU activos
     $personalizadasNt = reglas_personalizadas($pdo, 'NT');  // reglas creadas por el Administrador
     // --- segunda pasada: columnas calculadas y reglas por fila
     $filas = [];
@@ -415,8 +431,9 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
                     . ($spc ? (!(int) $spc['activo'] ? ' (inactivo)' : ' (sin clasificación CAPITA / EVENTO)') : ' (no existe en el catálogo)') . ': parametrizarlo en Catálogos → Subplanes Medicar');
             }
             // NT29: un CUM debe tener un solo PLU activo en SIESA; no aplica a insumos (799) ni a VITAL NO DISPONIBLE (aclaración del usuario, 2026-10-19)
+            // ni a los CUM aprobados con varios PLU en Inconsistencias (2026-11-05)
             $plusActivos = array_values(array_unique($siesa[$d]['activos'] ?? []));
-            if ($f !== '799' && _u($it['cum']) !== 'VITAL NO DISPONIBLE' && count($plusActivos) > 1) {
+            if ($f !== '799' && _u($it['cum']) !== 'VITAL NO DISPONIBLE' && count($plusActivos) > 1 && !nt_plu_varios_ok($variosAprobados, $d, $plusActivos)) {
                 $motivo('NT29', 'ERROR', "El CUM $d tiene " . count($plusActivos) . ' PLU activos en SIESA (' . implode(', ', $plusActivos) . '): debe quedar uno solo');
             }
             if ($cargaMedicar) {

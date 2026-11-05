@@ -14,7 +14,9 @@ require_once __DIR__ . '/creacion.php'; // nombres y estructuras de los archivos
 
 const COR_SISTEMAS = ['SIESA' => 'MAESTRO_SIESA', 'MEDICAR' => 'MAESTRA_MEDICAR'];
 const COR_ESTADOS = ['PENDIENTE_CORRECCION' => 'Por corregir', 'NO_VALIDADO' => 'No validado', 'PENDIENTE_REVISION' => 'Pendiente de revisión',
-    'PENDIENTE_ACTUALIZACION' => 'Pendiente de actualización', 'CORREGIDO' => 'Corregido'];
+    'PENDIENTE_ACTUALIZACION' => 'Pendiente de actualización', 'CORREGIDO' => 'Corregido', 'APROBADO' => 'Aprobado'];
+/** Estados cerrados: se conservan (trazabilidad) pero no se ven con lo pendiente. APROBADO = revisado y aprobado así (varios PLU). */
+const COR_CERRADOS = ['CORREGIDO', 'APROBADO'];
 const COR_EXPORTABLES = ['PENDIENTE_CORRECCION', 'NO_VALIDADO'];
 
 /**
@@ -54,6 +56,7 @@ function cor_calcular_siesa(PDO $pdo): array {
     $mt = [];
     foreach ($pdo->query('SELECT id, cum_facturar, contrato, cum, cod_auf, cod_mutual, iva, tipo_producto, activo FROM nt_item ORDER BY id') as $r) $mt[_u($r['cum_facturar'])][] = $r;
     $plusInactivos = nt_plus_inactivos($pdo); // estado por PLU + CONTRATO en la Maestra Tarifaria
+    $variosAprobados = nt_plu_varios_aprobados($pdo); // CUM aprobados con varios PLU activos
     $siesa = [];
     $st = $pdo->prepare('SELECT item, referencia, cum, registro_sanitario, cod_gen_audifarma, id_mutual, codigo_generico_auxiliar, grupo_impositivo, estado, tipo_medicamento
                          FROM ref_siesa_item WHERE carga_id = ? AND cum IN (SELECT cum_facturar FROM nt_item) ORDER BY id');
@@ -89,8 +92,9 @@ function cor_calcular_siesa(PDO $pdo): array {
         }
         // Un solo PLU por CUM FACTURAR: el activo; sin ninguno activo, el del COD AUF de la línea (prefijo del PLU) o el primero
         $activosSiesa = array_keys(array_filter($items, fn($i) => _u($i['estado']) === 'ACTIVO'));
-        $variosActivos = count($activosSiesa) > 1 && !$insumo;
-        $principal = count($activosSiesa) === 1 || ($insumo && $activosSiesa) ? $activosSiesa[0] : null;
+        $aprobado = !$insumo && nt_plu_varios_ok($variosAprobados, $cumFacturar, $activosSiesa); // revisado: debe tener varios PLU
+        $variosActivos = count($activosSiesa) > 1 && !$insumo && !$aprobado;
+        $principal = count($activosSiesa) === 1 || (($insumo || $aprobado) && $activosSiesa) ? $activosSiesa[0] : null;
         if ($principal === null && !$variosActivos) {
             foreach ($items as $plu => $i) if (explode('_', $plu)[0] === _u($usar[0]['cod_auf'])) { $principal = $plu; break; }
             $principal ??= array_key_first($items);
@@ -219,6 +223,7 @@ function cor_calcular_medicar(PDO $pdo): array {
     }
     $invima = _cor_invima($pdo);
     $plusInactivos = nt_plus_inactivos($pdo); // estado por PLU + CONTRATO en la Maestra Tarifaria
+    $variosAprobados = nt_plu_varios_aprobados($pdo); // CUM aprobados con varios PLU activos
     $out = [];
     foreach (nt_calcular($pdo)['filas'] as $l) {
         $cf = (string) $l['cum_facturar']; $cum = _u($cf);
@@ -249,7 +254,8 @@ function cor_calcular_medicar(PDO $pdo): array {
                 if (!in_array($p, $plus, true)) $add('PLU', $p, $p, implode(', ', $plus), "El PLU $p está activo en MEDICAR con el CUM $cf, pero en SIESA el CUM es del PLU " . implode(', ', $plus) . ': inactivarlo o corregir su CUM');
             }
         }
-        $variosSiesa = !$exento && count(array_filter($enSiesa)) > 1; // varios PLU activos en SIESA (NT29): primero se define en SIESA cuál queda
+        // varios PLU activos en SIESA (NT29): primero se define en SIESA cuál queda (salvo que el CUM esté aprobado con varios PLU)
+        $variosSiesa = !$exento && count(array_filter($enSiesa)) > 1 && !nt_plu_varios_ok($variosAprobados, $cf, array_keys(array_filter($enSiesa)));
         foreach ($plus as $p) {
             $activo = $activoLinea && !isset($plusInactivos[(int) $l['id']][$p]); // PLU inactivo en este contrato: se inactiva en su subplán
             $filas = $medPlu[$p] ?? null;
@@ -341,7 +347,7 @@ function cor_revisar(PDO $pdo, string $sistema, ?int $usuarioId): array {
     $actual = $sistema === 'MEDICAR' ? cor_calcular_medicar($pdo) : cor_calcular_siesa($pdo);
     $carga = _carga_vigente($pdo, COR_SISTEMAS[$sistema]);
     $abiertas = [];
-    $st = $pdo->prepare("SELECT * FROM cor_inconsistencia WHERE sistema = ? AND estado <> 'CORREGIDO'");
+    $st = $pdo->prepare("SELECT * FROM cor_inconsistencia WHERE sistema = ? AND estado NOT IN ('CORREGIDO', 'APROBADO')");
     $st->execute([$sistema]);
     foreach ($st as $r) $abiertas[$r['llave']] = $r;
     $ahora = ahora();
@@ -376,6 +382,50 @@ function cor_revisar(PDO $pdo, string $sistema, ?int $usuarioId): array {
     return $n;
 }
 
+/**
+ * Aprueba que un CUM tenga varios PLU activos en SIESA (pedido del usuario, 2026-11-05): se guardan los PLU activos de hoy; sus
+ * «Más de un PLU con el mismo CUM» pasan a APROBADO y la Maestra Tarifaria deja de marcar NT29. Si SIESA activa otro PLU, vuelve el error.
+ */
+function cor_aprobar_varios(PDO $pdo, string $cumFacturar, string $motivo, int $usuarioId): array {
+    $motivo = trim($motivo);
+    if ($motivo === '' || mb_strlen($motivo) > 300) throw new ErrorApi('Escriba el motivo (máximo 300 caracteres).', 422);
+    $cum = _u($cumFacturar);
+    $st = $pdo->prepare("SELECT referencia FROM ref_siesa_item WHERE carga_id = ? AND UPPER(cum) = ? AND UPPER(estado) = 'ACTIVO' ORDER BY id");
+    $st->execute([_carga_vigente($pdo, 'MAESTRO_SIESA'), $cum]);
+    $plus = array_values(array_unique(array_map('_u', $st->fetchAll(PDO::FETCH_COLUMN))));
+    if (count($plus) < 2) throw new ErrorApi("El CUM $cumFacturar no tiene varios PLU activos en el Maestro SIESA vigente.", 422);
+    $ahora = ahora();
+    $pdo->prepare("UPDATE cor_aprobacion SET activo = 0, retirado_por = ?, retirado_en = ? WHERE UPPER(cum_facturar) = ? AND campo = 'PLU_VARIOS' AND activo = 1")
+        ->execute([$usuarioId, $ahora, $cum]);
+    $id = insertar($pdo, 'cor_aprobacion', ['cum_facturar' => $cumFacturar, 'campo' => 'PLU_VARIOS', 'plus' => implode(',', $plus), 'motivo' => $motivo,
+        'activo' => 1, 'aprobado_por' => $usuarioId, 'aprobado_en' => $ahora]);
+    $st = $pdo->prepare("UPDATE cor_inconsistencia SET estado = 'APROBADO', cerrado_en = ?, actualizado_en = ?
+                          WHERE sistema = 'SIESA' AND campo = 'PLU_VARIOS' AND UPPER(cum_facturar) = ? AND estado NOT IN ('CORREGIDO', 'APROBADO')");
+    $st->execute([$ahora, $ahora, $cum]);
+    $cerradas = $st->rowCount();
+    auditar($usuarioId, 'COR_APROBAR', 'cor_aprobacion', $id, null, ['cum_facturar' => $cumFacturar, 'plus' => $plus, 'motivo' => $motivo, 'inconsistencias' => $cerradas]);
+    nt_calcular($pdo, true);
+    return ['id' => $id, 'plus' => $plus, 'aprobadas' => $cerradas];
+}
+
+/** Retira la aprobación de varios PLU: en la siguiente revisión vuelve el error si el CUM sigue con varios PLU activos. */
+function cor_quitar_aprobacion(PDO $pdo, int $id, int $usuarioId): array {
+    $st = $pdo->prepare('SELECT * FROM cor_aprobacion WHERE id = ? AND activo = 1');
+    $st->execute([$id]);
+    $a = $st->fetch();
+    if (!$a) throw new ErrorApi('La aprobación no existe o ya fue retirada.', 404);
+    $pdo->prepare('UPDATE cor_aprobacion SET activo = 0, retirado_por = ?, retirado_en = ? WHERE id = ?')->execute([$usuarioId, ahora(), $id]);
+    auditar($usuarioId, 'COR_APROBACION_QUITAR', 'cor_aprobacion', $id, ['cum_facturar' => $a['cum_facturar'], 'plus' => $a['plus']], null);
+    nt_calcular($pdo, true);
+    return ['ok' => true, 'revision' => cor_revisar($pdo, 'SIESA', $usuarioId)];
+}
+
+/** CUM aprobados con varios PLU (vigentes). */
+function cor_aprobaciones(PDO $pdo): array {
+    return $pdo->query("SELECT a.id, a.cum_facturar, a.plus, a.motivo, a.aprobado_en, u.nombre AS usuario FROM cor_aprobacion a
+                         LEFT JOIN seg_usuario u ON u.id = a.aprobado_por WHERE a.campo = 'PLU_VARIOS' AND a.activo = 1 ORDER BY a.cum_facturar")->fetchAll();
+}
+
 /** Resumen de un sistema: abiertas por estado y por campo, y la última revisión. */
 function cor_resumen(PDO $pdo, string $sistema): array {
     $st = $pdo->prepare('SELECT estado, campo, COUNT(*) AS n FROM cor_inconsistencia WHERE sistema = ? GROUP BY estado, campo');
@@ -383,7 +433,7 @@ function cor_resumen(PDO $pdo, string $sistema): array {
     $estados = array_fill_keys(array_keys(COR_ESTADOS), 0); $campos = [];
     foreach ($st as $r) {
         $estados[$r['estado']] += (int) $r['n'];
-        if ($r['estado'] !== 'CORREGIDO') $campos[$r['campo']] = ($campos[$r['campo']] ?? 0) + (int) $r['n'];
+        if (!in_array($r['estado'], COR_CERRADOS, true)) $campos[$r['campo']] = ($campos[$r['campo']] ?? 0) + (int) $r['n'];
     }
     $st = $pdo->prepare('SELECT r.*, u.nombre AS usuario, c.version, c.origen FROM cor_revision r LEFT JOIN seg_usuario u ON u.id = r.usuario_id
                           LEFT JOIN ref_carga c ON c.id = r.carga_id WHERE r.sistema = ? ORDER BY r.id DESC LIMIT 1');
