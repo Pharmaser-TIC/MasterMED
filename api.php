@@ -982,16 +982,16 @@ $acciones = [
     }],
     // CUM que sí deben tener varios PLU activos en SIESA (2026-11-05)
     'cor_aprobar' => ['POST', function () {
-        $u = requerir_permiso('CORRECCION.GESTIONAR');
+        $u = requerir_permiso('NT.GESTIONAR'); // se aprueba en la Maestra Tarifaria (NT29)
         $in = entrada();
         return transaccion(fn() => cor_aprobar_varios(db(), (string) ($in['cum_facturar'] ?? ''), (string) ($in['motivo'] ?? ''), $u['id']));
     }],
     'cor_aprobacion_quitar' => ['POST', function () {
-        $u = requerir_permiso('CORRECCION.GESTIONAR');
+        $u = requerir_permiso('NT.GESTIONAR');
         return transaccion(fn() => cor_quitar_aprobacion(db(), (int) (entrada()['id'] ?? 0), $u['id']));
     }],
     'cor_aprobaciones' => ['GET', function () {
-        requerir_permiso('CORRECCION.CONSULTAR');
+        requerir_permiso('NT.CONSULTAR');
         return ['aprobaciones' => cor_aprobaciones(db())];
     }],
     'cor_exportar' => ['POST', function () {

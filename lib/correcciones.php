@@ -55,8 +55,13 @@ function cor_calcular_siesa(PDO $pdo): array {
     if (!$carga) throw new ErrorApi('No hay Maestro SIESA cargado en Bases de referencia.', 422);
     $mt = [];
     foreach ($pdo->query('SELECT id, cum_facturar, contrato, cum, cod_auf, cod_mutual, iva, tipo_producto, activo FROM nt_item ORDER BY id') as $r) $mt[_u($r['cum_facturar'])][] = $r;
-    $plusInactivos = nt_plus_inactivos($pdo); // estado por PLU + CONTRATO en la Maestra Tarifaria
-    $variosAprobados = nt_plu_varios_aprobados($pdo); // CUM aprobados con varios PLU activos
+    // la Maestra Tarifaria manda (2026-11-05): estado de cada PLU en la Maestra Tarifaria por línea
+    $plusMt = []; $plusPend = []; $varios = [];
+    foreach (nt_calcular($pdo)['filas'] as $f) {
+        $plusMt[(int) $f['id']] = $f['_plus_mt'] ?? [];
+        $plusPend[(int) $f['id']] = $f['_plus_pend'] ?? [];
+        if ((int) $f['activo'] && str_contains($f['reglas'], 'NT29')) $varios[_u($f['cum_facturar'])] = true; // CUM con NT29 sin resolver
+    }
     $siesa = [];
     $st = $pdo->prepare('SELECT item, referencia, cum, registro_sanitario, cod_gen_audifarma, id_mutual, codigo_generico_auxiliar, grupo_impositivo, estado, tipo_medicamento
                          FROM ref_siesa_item WHERE carga_id = ? AND cum IN (SELECT cum_facturar FROM nt_item) ORDER BY id');
@@ -81,51 +86,45 @@ function cor_calcular_siesa(PDO $pdo): array {
             $out["SIESA|$cumFacturar|$plu|$campo"] = ['cum_facturar' => $cumFacturar, 'plu' => $plu, 'item' => $item, 'contratos' => $contratos, 'subplan' => null, 'campo' => $campo,
                 'actual' => $actual, 'esperado' => $esperado, 'accion' => $accion, 'revision' => $revision];
         };
-        // insumos (799): un mismo código puede tener varios PLU (presentaciones): no aplica «un solo PLU» (aclaración del usuario, 2026-10-19)
-        // y VITAL NO DISPONIBLE en la columna CUM: tampoco aplica (aclaración del usuario, 2026-10-19)
-        $insumo = !array_filter($usar, fn($l) => (in_array((string) $l['tipo_producto'], ['714', '799'], true) ? (string) $l['tipo_producto'] : nt_tipo_producto($cumFacturar)) !== '799')
-            || (bool) array_filter($usar, fn($l) => _u($l['cum']) === 'VITAL NO DISPONIBLE');
         $items = $siesa[$cum] ?? [];
         if (!$items) {
             if ($activo) $add('NO_EXISTE', '', null, null, null, 'Crear el producto en SIESA (Crear productos) o revisar el CUM FACTURAR de la Maestra Tarifaria');
             continue;
         }
-        // Un solo PLU por CUM FACTURAR: el activo; sin ninguno activo, el del COD AUF de la línea (prefijo del PLU) o el primero
-        $activosSiesa = array_keys(array_filter($items, fn($i) => _u($i['estado']) === 'ACTIVO'));
-        $aprobado = !$insumo && nt_plu_varios_ok($variosAprobados, $cumFacturar, $activosSiesa); // revisado: debe tener varios PLU
-        $variosActivos = count($activosSiesa) > 1 && !$insumo && !$aprobado;
-        $principal = count($activosSiesa) === 1 || (($insumo || $aprobado) && $activosSiesa) ? $activosSiesa[0] : null;
-        if ($principal === null && !$variosActivos) {
-            foreach ($items as $plu => $i) if (explode('_', $plu)[0] === _u($usar[0]['cod_auf'])) { $principal = $plu; break; }
-            $principal ??= array_key_first($items);
-        }
-        // Solo es error que el CUM tenga dos o más PLU ACTIVOS; un PLU inactivo con el mismo CUM (el que se creó mal y se reemplazó)
-        // no es error y no se valida (aclaración del usuario, 2026-10-19)
-        if ($variosActivos) {
-            foreach ($activosSiesa as $plu) {
-                $add('PLU_VARIOS', $plu, $items[$plu]['item'], "$plu (Activo)", implode(', ', $activosSiesa) . ': debe quedar uno solo activo',
-                    "El CUM $cumFacturar tiene varios PLU activos en SIESA: definir cuál queda e inactivar los demás (o corregir su MED-CUM)");
+        // La Maestra Tarifaria manda (2026-11-05): SIESA es espejo. Cada PLU debe estar en SIESA como está en la Maestra Tarifaria
+        // (activo si lo está en alguna línea activa del CUM). Varios PLU activos se resuelven en la Maestra Tarifaria (NT29: inactivar o aprobar),
+        // por eso ya no sale «Más de un PLU con el mismo CUM» aquí. Un PLU inactivo en las dos (el que se creó mal y se reemplazó) no se valida.
+        $mtPlu = []; // PLU => activo en la Maestra Tarifaria
+        foreach ($lineas as $l) foreach ($plusMt[(int) $l['id']] ?? [] as $p => $v) $mtPlu[(string) $p] = ($mtPlu[(string) $p] ?? false) || ((int) $l['activo'] === 1 && $v === 1);
+        $pendCum = [];
+        foreach ($lineas as $l) foreach ($plusPend[(int) $l['id']] ?? [] as $p) $pendCum[(string) $p] = true;
+        // CUM con varios PLU (NT29 sin resolver): se ve aquí, pero se define en la Maestra Tarifaria (pedido del usuario, 2026-11-05)
+        if (isset($varios[$cum])) {
+            $todos = array_keys(array_filter($mtPlu) + $pendCum);
+            foreach ($todos as $p) {
+                $p = (string) $p;
+                $add('PLU_VARIOS', $p, $items[$p]['item'] ?? null, $p . (isset($pendCum[$p]) ? ' (nuevo en SIESA, por definir)' : ' (activo en la Maestra Tarifaria)'),
+                    implode(', ', $todos) . ': debe quedar uno solo activo',
+                    "El CUM $cumFacturar tiene varios PLU: definir en la Maestra Tarifaria (NT29) cuál queda («Dejar inactivo» el que sobra) o «Aprobar varios PLU»");
             }
         }
-        $items = $activosSiesa ? array_intersect_key($items, array_flip($activosSiesa)) : [$principal => $items[$principal]]; // sin activos: solo el principal
         // valor que da la Maestra Tarifaria para un campo; si sus líneas no coinciden, no hay un único valor (revisión)
         $esperado = function (string $k) use ($usar) {
             $v = array_values(array_unique(array_map(fn($l) => trim((string) $l[$k]), $usar)));
             return [implode(' / ', $v), count($v) > 1];
         };
         foreach ($items as $plu => $i) {
+            $plu = (string) $plu;
             $siesaActivo = _u($i['estado']) === 'ACTIVO';
-            // PLU inactivo en la Maestra Tarifaria en todas las líneas activas del CUM (estado por PLU + CONTRATO): se inactiva en SIESA
-            if ($activas && !array_filter($activas, fn($l) => !isset($plusInactivos[(int) $l['id']][$plu]))) {
-                if ($siesaActivo) $add('ESTADO', $plu, $i['item'], 'Activo', 'Inactivo', 'Inactivar el PLU en SIESA (el PLU está inactivo en la Maestra Tarifaria)');
-                continue;
+            $mtActivo = $mtPlu[$plu] ?? false;
+            if (isset($pendCum[$plu])) continue; // por definir en la Maestra Tarifaria: sale como «Más de un PLU con el mismo CUM»
+            if ($siesaActivo !== $mtActivo) {
+                $add('ESTADO', $plu, $i['item'], ucfirst(mb_strtolower((string) $i['estado'])), $mtActivo ? 'Activo' : 'Inactivo', $mtActivo
+                    ? 'Activar el PLU en SIESA (está activo en la Maestra Tarifaria)'
+                    : (!$activo ? 'Inactivar el PLU en SIESA (la línea está inactiva en la Maestra Tarifaria)'
+                        : 'Inactivar el PLU en SIESA (está inactivo en la Maestra Tarifaria; si debe quedar activo, actívelo en la Maestra Tarifaria)'));
             }
-            // línea activa: el PLU debe estar activo (si ninguno lo está, se activa el principal); línea inactiva: cada PLU activo se inactiva
-            if (($activo ? $plu === $principal : $siesaActivo) && $siesaActivo !== $activo) {
-                $add('ESTADO', $plu, $i['item'], ucfirst(mb_strtolower((string) $i['estado'])), $activo ? 'Activo' : 'Inactivo',
-                    $activo ? 'Activar el PLU en SIESA' : 'Inactivar el PLU en SIESA (la línea está inactiva en la Maestra Tarifaria)');
-            }
-            if (!$activo) continue; // línea inactiva en la Maestra Tarifaria: solo se valida el estado
+            if (!$mtActivo) continue; // solo se validan los datos de los PLU activos en la Maestra Tarifaria
             // IVA: grupo impositivo según el IVA de la Maestra Tarifaria
             $ivas = array_values(array_unique(array_map(fn($l) => (int) round((float) $l['iva'] * 100), $usar)));
             $ivaSiesa = $ivaGrupo[(string) $i['grupo_impositivo']] ?? null;
@@ -222,7 +221,6 @@ function cor_calcular_medicar(PDO $pdo): array {
         if (trim((string) $r['opcion']) === '1') $medCum[_u($r['cum'])][$p] = true; // PLU activos de MEDICAR por CUM
     }
     $invima = _cor_invima($pdo);
-    $plusInactivos = nt_plus_inactivos($pdo); // estado por PLU + CONTRATO en la Maestra Tarifaria
     $variosAprobados = nt_plu_varios_aprobados($pdo); // CUM aprobados con varios PLU activos
     $out = [];
     foreach (nt_calcular($pdo)['filas'] as $l) {
@@ -236,14 +234,12 @@ function cor_calcular_medicar(PDO $pdo): array {
             $out["MEDICAR|$cf|$plu|$sp|$campo"] = ['cum_facturar' => $cf, 'plu' => $plu, 'item' => null, 'contratos' => $contrato, 'subplan' => $sp, 'campo' => $campo,
                 'actual' => $actual, 'esperado' => $esperado, 'accion' => $obs, 'revision' => $revision];
         };
-        // PLU de referencia: los activos de SIESA; sin activos, el del COD AUF; sin SIESA, los activos de MEDICAR por CUM
+        // La Maestra Tarifaria manda (2026-11-05): los PLU de la línea con su estado en la Maestra Tarifaria; MEDICAR es espejo.
+        // Sin PLU en SIESA: los activos de MEDICAR por CUM.
         $enSiesa = $siesa[$cum] ?? [];
-        $plus = array_keys(array_filter($enSiesa));
-        if (!$plus && $enSiesa) {
-            foreach (array_keys($enSiesa) as $p) if (explode('_', $p)[0] === _u($l['cod_auf'])) { $plus = [$p]; break; }
-            $plus = $plus ?: [array_key_first($enSiesa)];
-        }
-        if (!$plus) $plus = array_keys($medCum[$cum] ?? []);
+        $mt = $l['_plus_mt'] ?? [];
+        $plus = array_map('strval', array_keys($mt));
+        if (!$plus) $plus = array_map('strval', array_keys($medCum[$cum] ?? []));
         if (!$plus) {
             if ($activo) $add('NO_EXISTE', '', null, $sp, "No tiene PLU en SIESA ni en MEDICAR: crearlo en Crear productos (no va en el archivo de MEDICAR)");
             continue;
@@ -254,10 +250,13 @@ function cor_calcular_medicar(PDO $pdo): array {
                 if (!in_array($p, $plus, true)) $add('PLU', $p, $p, implode(', ', $plus), "El PLU $p está activo en MEDICAR con el CUM $cf, pero en SIESA el CUM es del PLU " . implode(', ', $plus) . ': inactivarlo o corregir su CUM');
             }
         }
-        // varios PLU activos en SIESA (NT29): primero se define en SIESA cuál queda (salvo que el CUM esté aprobado con varios PLU)
-        $variosSiesa = !$exento && count(array_filter($enSiesa)) > 1 && !nt_plu_varios_ok($variosAprobados, $cf, array_keys(array_filter($enSiesa)));
+        // varios PLU activos en la Maestra Tarifaria (NT29): primero se define allá cuál queda (salvo que el CUM esté aprobado con varios PLU)
+        $activosMt = [...array_map('strval', array_keys(array_filter($mt, fn($v) => $v === 1))), ...($l['_plus_pend'] ?? [])];
+        $variosSiesa = $activoLinea && !$exento && count($activosMt) > 1 && !nt_plu_varios_ok($variosAprobados, $cf, $activosMt);
+        $pendL = $l['_plus_pend'] ?? [];
         foreach ($plus as $p) {
-            $activo = $activoLinea && !isset($plusInactivos[(int) $l['id']][$p]); // PLU inactivo en este contrato: se inactiva en su subplán
+            if (in_array($p, $pendL, true)) continue; // por definir en la Maestra Tarifaria (NT29)
+            $activo = $activoLinea && (!$mt || ($mt[$p] ?? 0) === 1); // estado del PLU en la Maestra Tarifaria (PLU + CONTRATO)
             $filas = $medPlu[$p] ?? null;
             if (!$filas) { if ($activo) $add('PLU', $p, null, $p, "Crear en MEDICAR el PLU $p (CUM $cf) en el subplán $sp"); continue; }
             // todo lo que está en el Contrato Evento debe estar activo en MEDICAR en TRANSFERENCIA DE PENDIENTES (decisión del usuario, 2026-10-19)
@@ -390,10 +389,18 @@ function cor_aprobar_varios(PDO $pdo, string $cumFacturar, string $motivo, int $
     $motivo = trim($motivo);
     if ($motivo === '' || mb_strlen($motivo) > 300) throw new ErrorApi('Escriba el motivo (máximo 300 caracteres).', 422);
     $cum = _u($cumFacturar);
-    $st = $pdo->prepare("SELECT referencia FROM ref_siesa_item WHERE carga_id = ? AND UPPER(cum) = ? AND UPPER(estado) = 'ACTIVO' ORDER BY id");
-    $st->execute([_carga_vigente($pdo, 'MAESTRO_SIESA'), $cum]);
-    $plus = array_values(array_unique(array_map('_u', $st->fetchAll(PDO::FETCH_COLUMN))));
-    if (count($plus) < 2) throw new ErrorApi("El CUM $cumFacturar no tiene varios PLU activos en el Maestro SIESA vigente.", 422);
+    // los PLU activos del CUM en la Maestra Tarifaria (la MT manda, 2026-11-05)
+    // y los nuevos de SIESA «por definir», que al aprobar quedan activos en la Maestra Tarifaria
+    $plus = []; $activar = [];
+    foreach (nt_calcular($pdo, true)['filas'] as $f) {
+        if (_u($f['cum_facturar']) !== $cum || !(int) $f['activo']) continue;
+        foreach ($f['_plus_mt'] ?? [] as $p => $v) if ($v === 1) $plus[(string) $p] = true;
+        foreach ($f['_plus_pend'] ?? [] as $p) { $plus[(string) $p] = true; $activar[] = [(int) $f['id'], (string) $p]; }
+    }
+    $plus = array_map('strval', array_keys($plus));
+    if (count($plus) < 2) throw new ErrorApi("El CUM $cumFacturar no tiene varios PLU activos en la Maestra Tarifaria.", 422);
+    $up = $pdo->prepare('UPDATE nt_item_plu SET activo = 1, actualizado_por = ?, actualizado_en = ? WHERE nt_item_id = ? AND UPPER(plu) = ?');
+    foreach ($activar as [$idL, $p]) $up->execute([$usuarioId, ahora(), $idL, $p]);
     $ahora = ahora();
     $pdo->prepare("UPDATE cor_aprobacion SET activo = 0, retirado_por = ?, retirado_en = ? WHERE UPPER(cum_facturar) = ? AND campo = 'PLU_VARIOS' AND activo = 1")
         ->execute([$usuarioId, $ahora, $cum]);

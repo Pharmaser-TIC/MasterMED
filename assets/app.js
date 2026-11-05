@@ -1547,6 +1547,7 @@ async function pNota(c) {
       } }, svgIcono('quitar'), `Retirar ${miles(x.inactivas_medicar)} (inactivas o sin PLU)`) : '',
         h('button', { class: 'btn sec', title: 'Historial de versiones de la Maestra Tarifaria', onclick: () => versionesNT() }, svgIcono('capas'), 'Versiones'),
         h('button', { class: 'btn sec', title: 'Cambios de la Maestra Tarifaria por fecha (creadas, editadas, quitadas, importaciones)', onclick: () => cambiosNT() }, svgIcono('reloj'), 'Cambios'),
+        h('button', { class: 'btn sec', title: 'CUM revisados que sí deben tener varios PLU activos en la Maestra Tarifaria', onclick: () => aprobacionesVariosPlu(gestionar, recargar) }, svgIcono('ok'), 'Varios PLU aprobados'),
         meta.puede_descargar && x.total ? menuExportar() : ''));
   };
   const verRegla = (g, n) => {
@@ -1589,6 +1590,12 @@ async function pNota(c) {
   const num = (v) => (v === null || v === undefined || v === '' ? '' : miles(Math.round(Number(v))));
   const NT_ICO = { VALIDADO: 'ok', 'CON ALERTA': 'alerta', ERROR: 'error', INACTIVO: 'pendiente' };
   const NT_ETQ = { VALIDADO: 'Validada', 'CON ALERTA': 'Alerta', ERROR: 'Error', INACTIVO: 'Inactiva' };
+  const NT_CLS = { VALIDADO: 'ok', 'CON ALERTA': 'alerta', ERROR: 'error', INACTIVO: 'gris' };
+  // ESTADO en la tabla (pedido del usuario, 2026-11-05): solo Activo | Inactivo, de la línea o (en su fila) del PLU
+  const estadoNT = (f) => (Number(f.activo) === 1
+    ? h('span', { class: 'chip-estado e-ok', title: 'Activo' }, svgIcono('ok'), 'Activo')
+    : h('span', { class: 'chip-estado e-gris', title: f.plu_inactivo ? `El PLU ${f.plu} está inactivo (en todos los contratos y subplanes del CUM)` : 'Inactivo: no se valida ni se usa al crear productos' },
+      svgIcono('pendiente'), 'Inactivo'));
   // ---- activar / inactivar de forma masiva (pedido del usuario, 2026-10-16)
   const seleccion = new Set(); let todasFiltradas = false; let totalFiltrado = 0;
   const barraSel = h('div', { class: 'sel-barra', hidden: true });
@@ -1633,7 +1640,7 @@ async function pNota(c) {
       f.cum_validado_en ? [`Retirar validación del CUM (${String(f.cum_validado_en).slice(0, 10)})`, () => validarCum(false), 'quitar'] : null].filter(Boolean);
     // activar / inactivar por PLU + CONTRATO: cada fila es «id de la línea|PLU»
     const clave = `${f.id}|${f.plu ?? ''}`;
-    const casilla = h('input', { type: 'checkbox', class: 'sel-fila', dataset: { clave }, checked: seleccion.has(clave), title: 'Seleccionar para activar / inactivar (este PLU en este contrato)',
+    const casilla = h('input', { type: 'checkbox', class: 'sel-fila', dataset: { clave }, checked: seleccion.has(clave), title: 'Seleccionar para activar / inactivar este PLU (en todos los contratos y subplanes del CUM)',
       'aria-label': `Seleccionar ${f.cum_facturar}${f.plu ? ` PLU ${f.plu}` : ''}`, onchange: (ev) => { if (ev.target.checked) seleccion.add(clave); else seleccion.delete(clave); todasFiltradas = false; pintarSeleccion(); } });
     return h('div', { class: 'acciones-fila' }, casilla,
       h('button', { type: 'button', class: 'btn-icono', title: 'Editar', 'aria-label': 'Editar', onclick: () => editarNT(f, () => tabla.refrescar()) }, svgIcono('editar')),
@@ -1645,6 +1652,7 @@ async function pNota(c) {
   // sus resultados salen en OBSERVACIONES.
   const columnas = [
     gestionar ? { titulo: '', filtro: false, valor: accionesFila } : null,
+    { titulo: 'ESTADO', campo: 'activo_estado', valor: estadoNT, filtro: { campo: 'activo_estado', opciones: [['ACTIVO', 'Activo'], ['INACTIVO', 'Inactivo']] } },
     { titulo: 'FECHA DE CREACION', campo: 'fecha' },
     { titulo: 'CONTRATO', campo: 'contrato_vista' },
     { titulo: 'SUBPLAN', campo: 'subplan' },
@@ -1670,12 +1678,19 @@ async function pNota(c) {
     { titulo: 'CONCENTRACION RIPS', campo: 'umm_rips' },
     { titulo: 'UNIDAD MEDIDA RIPS', campo: 'upr_rips' },
     { titulo: 'OBSERVACIONES', campo: 'reglas', valor: (f) => {
-      const m = f.motivos;
-      if (!m.length) return '';
+      // validada, con alerta o con error (pedido del usuario, 2026-11-05); la inactiva no se valida
+      const m = f.motivos || [];
+      if (f.estado === 'INACTIVO' && !f.plu_pendiente) return h('span', { class: 'nota' }, 'No se valida (inactivo)');
+      const chip = h('span', { class: `chip-estado e-${NT_CLS[f.estado] || 'gris'}` }, svgIcono(NT_ICO[f.estado] || 'pendiente'), NT_ETQ[f.estado] || f.estado);
+      if (!m.length) return h('div', { class: 'obs-celda' }, chip);
       const primero = m.find((x) => x.nivel === 'ERROR') || m[0];
-      return h('div', { class: `motivo-corto ${primero.nivel === 'ERROR' ? 'error' : 'alerta-txt'}`, title: m.map((x) => `${x.codigo}: ${x.texto}`).join('\n') },
-        `${primero.codigo}: ${primero.texto}`, m.length > 1 ? h('span', { class: 'nota' }, ` +${m.length - 1} más`) : null);
-    }, filtro: { campo: 'reglas', opciones: [['', '(Sin observaciones)'], ...meta.reglas.map((x) => [x.codigo, `${x.codigo} · ${nombreRegla[x.codigo]}`])] } },
+      const nt29 = gestionar ? m.find((x) => x.codigo === 'NT29') : null;
+      return h('div', { class: 'obs-celda' }, chip,
+        nt29 ? botonAprobarVarios(f, nt29, () => tabla.refrescar()) : null,
+        nt29 && f.plu_pendiente ? botonDejarInactivo(f, () => tabla.refrescar()) : null,
+        h('div', { class: `motivo-corto ${primero.nivel === 'ERROR' ? 'error' : 'alerta-txt'}`, title: m.map((x) => `${x.codigo}: ${x.texto}`).join('\n') },
+          `${primero.codigo}: ${primero.texto}`, m.length > 1 ? h('span', { class: 'nota' }, ` +${m.length - 1} más`) : null));
+    }, filtro: { campo: 'reglas', opciones: [['', '(Validada · sin observaciones)'], ...meta.reglas.map((x) => [x.codigo, `${x.codigo} · ${nombreRegla[x.codigo]}`])] } },
   ].filter(Boolean).filter((c) => meta.con_precios !== false || !NT_COLUMNAS_PRECIO.includes(c.campo)); // perfil sin precios
   const zona = h('div', { class: 'tarjeta' }, reglasZona, barraSel);
   c.append(zona);
@@ -2008,11 +2023,16 @@ function editarNT(f, alGuardar, base = {}) {
     iva: sel(String(Number(f.iva) ? 0.19 : 0), [['0', '0 %'], ['0.19', '19 %']]),
   };
   const conFuente = !!f.fuente_precio && f.fuente_precio !== 'DIGITADO';
-  // el interruptor es de la línea completa (todos sus PLU); el activar / inactivar por PLU se hace con la casilla de la tabla
-  let activo = Number(f.activo_linea ?? f.activo) === 1;
-  const interruptor = h('button', { type: 'button', class: `interruptor${activo ? ' on' : ''}`, role: 'switch', 'aria-checked': String(activo), 'aria-label': 'Línea activa',
-    onclick: () => { activo = !activo; interruptor.classList.toggle('on', activo); interruptor.setAttribute('aria-checked', String(activo)); estadoTxt.textContent = activo ? 'Activa' : 'Inactiva: no se valida ni se usa al crear productos'; } }, h('span', {}));
-  const estadoTxt = h('span', { class: 'nota' }, activo ? 'Activa' : 'Inactiva: no se valida ni se usa al crear productos');
+  // la inactivación es por PLU (aclaración del usuario, 2026-11-05): el interruptor es del PLU de la fila y se aplica en todas las líneas
+  // del CUM que lo tienen (todos sus contratos y subplanes); sin PLU, es de la línea
+  const porPlu = !!(f.plu && f.id);
+  const lineaActiva = Number(f.activo_linea ?? f.activo) === 1;
+  const activoInicial = porPlu ? Number(f.activo) === 1 : lineaActiva;
+  let activo = activoInicial;
+  const txtEstado = () => (activo ? 'Activo' + (porPlu ? '' : 'a') : porPlu ? 'Inactivo: este PLU no se valida ni se usa en este contrato' : 'Inactiva: no se valida ni se usa al crear productos');
+  const interruptor = h('button', { type: 'button', class: `interruptor${activo ? ' on' : ''}`, role: 'switch', 'aria-checked': String(activo), 'aria-label': porPlu ? `PLU ${f.plu} activo` : 'Línea activa',
+    onclick: () => { activo = !activo; interruptor.classList.toggle('on', activo); interruptor.setAttribute('aria-checked', String(activo)); estadoTxt.textContent = txtEstado(); } }, h('span', {}));
+  const estadoTxt = h('span', { class: 'nota' }, txtEstado());
   // precio final con IVA, en vivo
   const final = ro('');
   const calcFinal = () => { const p = Number(c.precio_venta.value); final.value = c.precio_venta.value === '' ? '' : pesos(Math.round(p * (1 + Number(c.iva.value)))); };
@@ -2031,7 +2051,8 @@ function editarNT(f, alGuardar, base = {}) {
     h('div', { class: 'form-cuerpo' },
       motivos.length ? h('section', { class: 'seccion-form' }, h('h3', {}, svgIcono('alerta'), `Observaciones de la línea (${motivos.length})`),
         h('div', { class: 'lista-val' }, ...motivos.map((m) => h('div', { class: `val-item ${m.nivel === 'ERROR' ? 'v-error' : 'v-alerta'}` },
-          h('div', { class: 'val-cab' }, svgIcono(m.nivel === 'ERROR' ? 'error' : 'alerta'), h('strong', {}, m.codigo), h('span', {}, ` ${m.texto}`)))))) : null,
+          h('div', { class: 'val-cab' }, svgIcono(m.nivel === 'ERROR' ? 'error' : 'alerta'), h('strong', {}, m.codigo), h('span', {}, ` ${m.texto}`),
+            m.codigo === 'NT29' && f.id ? botonAprobarVarios(f, m, () => { dlg.close(); alGuardar(); }) : null))))) : null,
       seccion(1, 'Identificación', campo('cum_facturar', 'CUM a facturar', ro(f.cum_facturar)), campo('contrato', 'Contrato · subplán', ro(lineaNT(f.contrato))),
         campo('cum', 'CUM', c.cum), campo('cod_auf', 'COD AUF', c.cod_auf), campo('tipo_producto', 'Tipo de producto', c.tipo_producto)),
       seccion(2, 'Producto y códigos', h('div', { class: 'ancho-doble' }, campo('descripcion', 'Descripción', c.descripcion)),
@@ -2042,8 +2063,8 @@ function editarNT(f, alGuardar, base = {}) {
         : f.contrato === 'CAPITA' ? 'Sin tarifa en el Listado Cápita: se usa el precio digitado.'
           : 'Precio propio de la línea: el Contrato Evento es el tope (si el precio final lo supera, GLOSA TARIFA).'), campo('iva', 'IVA', c.iva),
         h('label', {}, 'Precio final + IVA', final),
-        h('div', { class: 'campo-interruptor ancho-total' }, interruptor, h('strong', {}, 'Línea activa'), estadoTxt,
-          f.plu_inactivo ? h('span', { class: 'nota' }, `El PLU ${f.plu} está inactivo en este contrato. Este interruptor cambia la línea completa (todos sus PLU).`) : null))),
+        h('div', { class: 'campo-interruptor ancho-total' }, interruptor, h('strong', {}, porPlu ? `PLU ${f.plu} activo` : 'Línea activa'), estadoTxt,
+          porPlu ? h('span', { class: 'nota' }, 'Cambia este PLU en todos los contratos y subplanes del CUM; los demás PLU quedan igual.') : null))),
     err,
     h('div', { class: 'form-pie' }, h('span', { class: 'espacio' }),
       h('button', { class: 'btn sec', value: 'cancelar', formnovalidate: true }, 'Cancelar'),
@@ -2055,9 +2076,14 @@ function editarNT(f, alGuardar, base = {}) {
     const v = Object.fromEntries(Object.entries(c).map(([k, e]) => [k, e.value]));
     if (conFuente) v.precio_venta = f.precio_digitado ?? ''; // el calculado no se guarda como digitado
     try {
-      const r = await api('nt_guardar', { metodo: 'POST', datos: { ...v, id: f.id, activo } }); // mismos campos que enviaba el formulario anterior
+      const r = await api('nt_guardar', { metodo: 'POST', datos: { ...v, id: f.id, activo: porPlu ? lineaActiva : activo } }); // mismos campos que enviaba el formulario anterior
+      let cambioPlu = false;
+      if (porPlu && activo !== activoInicial) { // solo este PLU + CONTRATO; queda en auditoría con el PLU
+        await api('nt_activar_masivo', { metodo: 'POST', datos: { filas: [`${f.id}|${f.plu}`], activar: activo, motivo: 'Desde el formulario de edición' } });
+        cambioPlu = true;
+      }
       dlg.close();
-      toast(r.cambios ? `Guardado. Validaciones recalculadas.${r.lineas_repetidas ? ` Se crearon ${r.lineas_repetidas} líneas en otros contratos.` : ''}` : 'Sin cambios.');
+      toast(r.cambios || cambioPlu ? `Guardado.${cambioPlu ? ` PLU ${f.plu} ${activo ? 'activado' : 'inactivado'} en este contrato.` : ''} Validaciones recalculadas.${r.lineas_repetidas ? ` Se crearon ${r.lineas_repetidas} líneas en otros contratos.` : ''}` : 'Sin cambios.');
       alGuardar();
     } catch (e) { err.textContent = e.message; }
   };
@@ -2627,8 +2653,6 @@ async function pCorrecciones(c) {
       h('span', { class: `nota cor-revision${desactualizada ? ' cor-desact' : ''}` }, rev ? `Revisado ${fecha(rev.creado_en)} · ${COR_BASE[sistema]} v${rev.version ?? '—'}${desactualizada ? ' (hay una versión más nueva: revise de nuevo)' : ''}` : 'Aún no se ha revisado'),
       gestionar ? h('button', { class: 'btn sec', onclick: (ev) => revisar(ev.currentTarget) }, svgIcono('recargar'), 'Revisar ahora') : null,
       gestionar ? h('button', { class: 'btn sec', onclick: () => descargasCorrecciones(sistema) }, svgIcono('carpeta'), 'Descargas') : null,
-      esMed ? null : h('button', { class: 'btn sec', title: 'CUM revisados que sí deben tener varios PLU activos', onclick: () => aprobacionesVariosPlu(gestionar, () => tabla.refrescar()) },
-        svgIcono('ok'), 'Varios PLU aprobados'),
       gestionar ? h('button', { class: 'btn primario', disabled: !rs.exportables, onclick: () => descargar(rs.exportables),
         title: rs.exportables ? 'Descarga los archivos de cargue con lo pendiente (respeta los filtros de la tabla)' : 'No hay correcciones pendientes por descargar' },
       svgIcono('bajar'), `${esMed ? 'Archivo PLU + observación' : 'Archivos de cargue'} (${miles(rs.exportables)})`) : null,
@@ -2663,20 +2687,36 @@ async function pCorrecciones(c) {
       esMed ? null : { campo: 'cargue', titulo: 'Se carga con', filtro: { campo: 'cargue', opciones: Object.entries(COR_CARGUE) }, valor: (f) => COR_CARGUE[f.cargue] || f.cargue },
       { campo: 'detectado_en', titulo: 'Detectado', valor: (f) => fecha(f.detectado_en) },
       { campo: 'exportado_en', titulo: 'Descargado', valor: (f) => (f.exportado_en ? fecha(f.exportado_en) : '') },
-      // CUM que sí debe tener varios PLU: se aprueba y deja de salir como «por corregir» (2026-11-05)
-      gestionar && !esMed ? { titulo: 'Acciones', filtro: false, valor: (f) => (f.campo === 'PLU_VARIOS' && !COR_CERRADOS.includes(f.estado)
-        ? h('button', { type: 'button', class: 'btn sec chico', title: 'Este CUM sí debe tener varios PLU: aprobarlo como revisado', onclick: () => aprobarVariosPlu(f, () => tabla.refrescar()) },
-          svgIcono('ok'), 'Aprobar') : '') } : null,
     ].filter(Boolean) });
   t.onmouseover = (ev) => { const td = ev.target.closest?.('.tabla-datos td'); if (td && !td.title && td.scrollWidth > td.clientWidth) td.title = td.textContent; };
 }
 
+/** Botón «Aprobar varios PLU» para la observación NT29 de la Maestra Tarifaria (los PLU salen del texto de la regla). */
+function botonAprobarVarios(f, motivo, alGuardar) {
+  const plus = /\(([^)]+)\)/.exec(motivo.texto || '')?.[1] || null;
+  return h('button', { type: 'button', class: 'btn sec chico btn-aprobar-varios', title: 'Este CUM sí debe tener varios PLU activos: aprobarlo como revisado (NT29 deja de salir)',
+    onclick: (ev) => { ev.stopPropagation(); aprobarVariosPlu(f, alGuardar, plus); } }, svgIcono('ok'), 'Aprobar varios PLU');
+}
+
+/** PLU nuevo de SIESA «por definir» (NT29): se deja inactivo en la Maestra Tarifaria; Inconsistencias pide luego inactivarlo en SIESA. */
+function botonDejarInactivo(f, alGuardar) {
+  return h('button', { type: 'button', class: 'btn sec chico btn-aprobar-varios', title: `El PLU ${f.plu} sobra: dejarlo inactivo en la Maestra Tarifaria (NT29 deja de salir)`,
+    onclick: async (ev) => {
+      ev.stopPropagation();
+      if (!await confirmar('Dejar inactivo', `El PLU ${f.plu} queda inactivo en la Maestra Tarifaria para el CUM ${f.cum_facturar}. Inconsistencias SIESA pedirá inactivarlo en SIESA.`, 'Dejar inactivo')) return;
+      await api('nt_activar_masivo', { metodo: 'POST', datos: { filas: [`${f.id}|${f.plu}`], activar: false, motivo: 'PLU nuevo de SIESA: se deja inactivo (NT29)' } });
+      toast(`PLU ${f.plu} queda inactivo en la Maestra Tarifaria.`); alGuardar();
+    } }, svgIcono('quitar'), 'Dejar inactivo');
+}
+
 /** Aprueba que un CUM tenga varios PLU activos en SIESA: sus «Más de un PLU con el mismo CUM» pasan a «Aprobado». */
-function aprobarVariosPlu(f, alGuardar) {
+function aprobarVariosPlu(f, alGuardar, plusTxt = null) {
   dialogo({
     titulo: `Aprobar varios PLU del CUM ${f.cum_facturar}`,
-    texto: `El CUM queda revisado: sus PLU activos en SIESA (${f.valor_esperado?.split(':')[0] || 'los de hoy'}) se aceptan y deja de salir «Más de un PLU con el mismo CUM» `
-      + '(y NT29 en la Maestra Tarifaria). Si después SIESA activa otro PLU con este CUM, el error vuelve a salir. Queda en auditoría y se puede retirar.',
+    texto: `Use esto solo si el CUM SÍ debe tener varios PLU activos. Si sobra uno, inactívelo en la Maestra Tarifaria en lugar de aprobar `
+      + '(Inconsistencias pide luego inactivarlo en SIESA y MEDICAR). '
+      + `El CUM queda revisado: sus PLU activos en la Maestra Tarifaria (${plusTxt || 'los de hoy'}) se aceptan y NT29 deja de salir. `
+      + 'Si después se activa otro PLU de este CUM, el error vuelve a salir. Queda en auditoría y se puede retirar.',
     campos: [{ nombre: 'motivo', etiqueta: 'Motivo', requerido: true, placeholder: 'Ej.: dos presentaciones del mismo CUM, ambas vigentes' }],
     aceptar: 'Aprobar',
     alEnviar: async (v) => {
@@ -2693,7 +2733,7 @@ async function aprobacionesVariosPlu(gestionar, alCambiar) {
   const dlg = $('#dialogo'); const form = $('#dialogo-form');
   dlg.onclose = null; dlg.oncancel = null;
   const quitar = async (x) => {
-    if (!await confirmar('Retirar aprobación', `El CUM ${x.cum_facturar} vuelve a revisarse: si sigue con varios PLU activos en SIESA, sale otra vez «Más de un PLU con el mismo CUM».`, 'Retirar')) return;
+    if (!await confirmar('Retirar aprobación', `El CUM ${x.cum_facturar} vuelve a revisarse: si sigue con varios PLU activos en la Maestra Tarifaria, sale otra vez NT29.`, 'Retirar')) return;
     await api('cor_aprobacion_quitar', { metodo: 'POST', datos: { id: x.id } });
     toast('Aprobación retirada.'); dlg.close(); alCambiar();
   };
@@ -2704,7 +2744,7 @@ async function aprobacionesVariosPlu(gestionar, alCambiar) {
     h('div', { class: 'form-encabezado' }, h('h2', {}, 'CUM aprobados con varios PLU'),
       h('button', { type: 'button', class: 'btn-icono cerrar-x', title: 'Cerrar (Esc)', 'aria-label': 'Cerrar', onclick: () => dlg.close() }, '✕')),
     r.aprobaciones.length ? tablaConFiltros(['CUM FACTURAR', 'PLU aprobados', 'Motivo', 'Aprobó', 'Fecha', ''], filas, { sinFiltro: [5], alto: 420 })
-      : h('p', { class: 'nota' }, 'Aún no hay CUM aprobados con varios PLU. Se aprueban desde la fila «Más de un PLU con el mismo CUM» (botón Aprobar).'));
+      : h('p', { class: 'nota' }, 'Aún no hay CUM aprobados con varios PLU. Se aprueban en la Maestra Tarifaria, en la observación NT29 (botón «Aprobar varios PLU»).'));
   form.onsubmit = () => {};
   dlg.classList.add('ancho');
   const fuera = (ev) => { if (ev.target === dlg) dlg.close(); };

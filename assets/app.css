@@ -462,6 +462,8 @@ dialog.ancho-nt { width: min(980px, calc(100vw - 32px)); }
 .nt-reglas .chip { font-size: 10.5px; padding: 1px 7px; }
 .tabla-nt td { vertical-align: middle; }
 .tabla-nt .chip-estado { font-size: 11px; padding: 2px 8px 2px 6px; }
+.obs-celda { display: flex; align-items: center; gap: 6px; } .obs-celda .motivo-corto { min-width: 0; }
+.btn-aprobar-varios { white-space: nowrap; flex: none; } .val-cab .btn-aprobar-varios { margin-left: auto; }
 .tabla-nt .btn-icono { width: 26px; height: 26px; }
 .tabla-nt .btn-icono .ico { width: 15px; height: 15px; }
 .tabla-nt .desc-linea { max-width: 280px; }

@@ -306,6 +306,11 @@ function migraciones_datos(PDO $pdo): array {
             $pdo->exec("DELETE FROM proc_resultado WHERE regla_codigo IN ('A04', 'NT17')");
             $pdo->exec("DELETE FROM proc_regla WHERE codigo IN ('A04', 'NT17')");
         }],
+        'M037_NT29_MAESTRA_TARIFARIA' => ['NT29 se valida en la Maestra Tarifaria (la MT manda; SIESA y MEDICAR son espejo): decisión del usuario, 2026-11-05', function (PDO $pdo) {
+            $pdo->prepare('UPDATE proc_regla SET descripcion = ?, base_comparada = ?, accion_sugerida = ? WHERE codigo = ?')
+                ->execute(['Maestra Tarifaria: la línea tiene más de un PLU activo en la Maestra Tarifaria (no aplica a insumos 799 ni a VITAL NO DISPONIBLE)', 'Maestra Tarifaria',
+                    'Inactivar en la Maestra Tarifaria el PLU que sobra (Inconsistencias pide luego inactivarlo en SIESA y MEDICAR) o, si el CUM sí lleva varios PLU, «Aprobar varios PLU»', 'NT29']);
+        }],
         'M036_RETIRAR_NT' => ['7J: NT27 = inactiva en SIESA y en MEDICAR (se retira); activa en SIESA e inactiva en MEDICAR pasa a corrección en MEDICAR', function (PDO $pdo) {
             $pdo->prepare('UPDATE proc_regla SET descripcion = ?, base_comparada = ?, accion_sugerida = ? WHERE codigo = ?')
                 ->execute(['Maestra Tarifaria: la línea está inactiva en SIESA y en MEDICAR', 'Maestro SIESA / Maestra MEDICAR', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)', 'NT27']);
@@ -550,7 +555,7 @@ function semilla_reglas(PDO $pdo): void {
         ['NT13', 'Maestra Tarifaria: COD AUF no existe en COD GEN',                             'ALERTA', 'COD GEN',               'Corregir o crear el COD GEN'],
         ['NT25', 'Maestra Tarifaria: el CUM (o código del insumo) no está en el Maestro SIESA', 'ERROR', 'Maestro SIESA', 'Crear el producto en SIESA'],
         ['NT26', 'Maestra Tarifaria: la línea no está creada en MEDICAR en el subplán de su contrato', 'ERROR', 'Maestra MEDICAR', 'Crear el producto en MEDICAR'],
-        ['NT29', 'Maestra Tarifaria: el CUM tiene más de un PLU activo en SIESA (no aplica a insumos 799 ni a VITAL NO DISPONIBLE)', 'ERROR', 'Maestro SIESA', 'Inactivar en SIESA el PLU que sobra (ver Inconsistencias)'],
+        ['NT29', 'Maestra Tarifaria: la línea tiene más de un PLU activo en la Maestra Tarifaria (no aplica a insumos 799 ni a VITAL NO DISPONIBLE)', 'ERROR', 'Maestra Tarifaria', 'Inactivar en la Maestra Tarifaria el PLU que sobra (Inconsistencias pide luego inactivarlo en SIESA y MEDICAR) o, si el CUM sí lleva varios PLU, «Aprobar varios PLU»'],
         ['NT28', 'Maestra Tarifaria: el subplán de la línea no está parametrizado (sin clasificación CAPITA / EVENTO o inactivo)', 'ALERTA', 'Subplanes', 'Parametrizar el subplán en Catálogos → Subplanes Medicar'],
         ['NT27', 'Maestra Tarifaria: la línea está inactiva en SIESA y en MEDICAR', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)'],
         ['NT30', 'Maestra Tarifaria: sin PLU en SIESA ni en MEDICAR', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)'],

@@ -113,6 +113,19 @@ function nt_plu_varios_ok(array $aprobados, string $cumFacturar, array $plusActi
     return $ap !== null && count($plusActivos) > 1 && !array_diff(array_map('_u', $plusActivos), $ap);
 }
 
+/**
+ * Estado de cada PLU en la Maestra Tarifaria (2026-11-05: la Maestra Tarifaria manda y SIESA / MEDICAR son espejo):
+ * [id de la línea => [PLU => 1 activo | 0 inactivo]].
+ */
+function nt_plus_estado(PDO $pdo, ?array &$decididos = null): array {
+    $r = []; $decididos = [];
+    foreach ($pdo->query('SELECT nt_item_id, plu, activo, actualizado_por FROM nt_item_plu ORDER BY id') as $x) {
+        $r[(int) $x['nt_item_id']][_u($x['plu'])] = (int) $x['activo'];
+        if ($x['actualizado_por'] !== null) $decididos[(int) $x['nt_item_id']][_u($x['plu'])] = true; // lo definió un usuario
+    }
+    return $r;
+}
+
 /** PLU inactivos en una línea activa (estado por PLU + CONTRATO, 2026-10-26): [id de la línea => [PLU => true]]. */
 function nt_plus_inactivos(PDO $pdo): array {
     $r = [];
@@ -257,7 +270,8 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
     unset($it);
 
     $inactivasNt = reglas_inactivas($pdo);                // una regla inactiva no se aplica
-    $plusInactivos = nt_plus_inactivos($pdo);              // estado por PLU + CONTRATO
+    $estadoPlu = nt_plus_estado($pdo, $decididosPlu);      // estado de cada PLU en la Maestra Tarifaria (PLU + CONTRATO)
+    $pendPlu = [];                                         // PLU que entran a la Maestra Tarifaria o cambian solos (se guardan al final)
     $variosAprobados = nt_plu_varios_aprobados($pdo);       // CUM aprobados con varios PLU activos
     $personalizadasNt = reglas_personalizadas($pdo, 'NT');  // reglas creadas por el Administrador
     // --- segunda pasada: columnas calculadas y reglas por fila
@@ -266,7 +280,31 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
         $d = (string) $it['cum_facturar']; $e = _u($it['cod_auf']); $j = _u($it['cod_mutual']);
         $esCum = (bool) preg_match('/^\d+-\d+$/', $d);
         $itemsSiesa = $siesa[$d]['items'] ?? ($esCum ? [] : ($siesaGen[_u($d)] ?? []));
-        $siesaLinea = _nt_siesa_item($itemsSiesa, (string) ($it['_h'] ?? ''));
+        // La Maestra Tarifaria manda (2026-11-05): cada PLU de la línea tiene su estado en la Maestra Tarifaria (nt_item_plu); SIESA y
+        // MEDICAR deben ser espejo y lo distinto sale en Inconsistencias. El PLU de SIESA que aún no está en la Maestra Tarifaria entra:
+        //  - si la línea ya tiene un PLU activo: INACTIVO y «por definir» (decisión del usuario): sale NT29 hasta que el usuario lo apruebe
+        //    («Aprobar varios PLU») o lo deje inactivo; insumos (799) y VITAL NO DISPONIBLE llevan varias presentaciones: entra como en SIESA;
+        //  - si no tiene ninguno (arranque o producto nuevo): como está hoy en SIESA.
+        // Una línea activa sin ningún PLU activo (se reactivó la línea) toma los activos de SIESA o, si no hay, el principal.
+        $idL = (int) $it['id'];
+        $est = $estadoPlu[$idL] ?? [];
+        $exentoPlu = (in_array((string) $it['tipo_producto'], ['714', '799'], true) ? (string) $it['tipo_producto'] : nt_tipo_producto($d)) === '799'
+            || _u($it['cum']) === 'VITAL NO DISPONIBLE';
+        $deLinea = _nt_plus_de_linea($itemsSiesa, (string) ($it['_h'] ?? ''), $est);
+        $presentes = array_intersect_key($est, $deLinea);
+        $cambio = [];
+        foreach (array_diff_key($deLinea, $est) as $pl => $r) $cambio[$pl] = in_array(1, $presentes, true) && !$exentoPlu ? 0 : (_u($r['estado']) === 'ACTIVO' ? 1 : 0);
+        $tras = $cambio + $presentes;
+        if ($tras && !in_array(1, $tras, true) && ((int) $it['activo'] || !$presentes)) {
+            $act = array_keys(array_filter($deLinea, fn($r) => _u($r['estado']) === 'ACTIVO'));
+            foreach ($act ?: [_nt_plu_principal(array_keys($deLinea), [$e, _u((string) ($it['_h'] ?? ''))])] as $pl) $cambio[$pl] = 1;
+        }
+        foreach ($cambio as $pl => $v) { $pendPlu[] = [$idL, (string) $pl, $v, isset($est[$pl])]; $est[$pl] = $v; }
+        $estadoPlu[$idL] = $est;
+        $siesaLinea = _nt_siesa_item($deLinea, $est);
+        // PLU por definir: activo en SIESA, inactivo en la Maestra Tarifaria sin que un usuario lo haya decidido, en una línea con PLU activo
+        $siesaLinea['_plus_pend'] = $exentoPlu || !in_array(1, $siesaLinea['_plus_mt'], true) ? [] : array_map('strval', array_keys(array_filter($deLinea,
+            fn($r, $pl) => ($est[$pl] ?? 0) === 0 && _u($r['estado']) === 'ACTIVO' && !isset($decididosPlu[$idL][$pl]), ARRAY_FILTER_USE_BOTH)));
         // ATC: el del ítem de SIESA; si no lo tiene (o dice NO APLICA), el de la Maestra Mutual por el CUM (antes de las reglas, que lo validan)
         $atc = fn(?string $v) => ($v === null || in_array(_u($v), ['NO APLICA', 'NA', 'N/A', '0'], true)) ? ($atcMutual[_u($d)] ?? $v) : $v;
         $siesaLinea['atc'] = $atc($siesaLinea['atc']);
@@ -276,6 +314,7 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
         $subplanLinea = nt_subplan_linea($k, $posNoPos[_u($it['cod_auf'])] ?? null);
         // MEDICAR en el subplán de la línea: EVENTO va en EVENTO POS o EVENTO NO PBS según el POS / NO POS del COD GEN (2026-10-19)
         $subplanesMed = $subplanLinea !== null ? [$subplanLinea] : (NT_SUBPLAN_MEDICAR[$k] ?? []);
+        // la línea se valida con sus PLU activos en la Maestra Tarifaria (el PLU inactivo no genera errores)
         $medLinea = _nt_medicar($siesaLinea['_plus'], $d, $subplanesMed, $medPlu, $medCum);
         $f = in_array((string) $it['tipo_producto'], ['714', '799'], true) ? (string) $it['tipo_producto'] : nt_tipo_producto($d);
         $gm = $esCapita ? $e : $j; // código con el que se agrupa el precio M
@@ -430,11 +469,16 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
                 $motivo('NT28', 'ALERTA', $subplanLinea === null ? "El contrato «{$k}» no tiene subplán definido" : "El subplán $subplanLinea no está parametrizado"
                     . ($spc ? (!(int) $spc['activo'] ? ' (inactivo)' : ' (sin clasificación CAPITA / EVENTO)') : ' (no existe en el catálogo)') . ': parametrizarlo en Catálogos → Subplanes Medicar');
             }
-            // NT29: un CUM debe tener un solo PLU activo en SIESA; no aplica a insumos (799) ni a VITAL NO DISPONIBLE (aclaración del usuario, 2026-10-19)
-            // ni a los CUM aprobados con varios PLU en Inconsistencias (2026-11-05)
-            $plusActivos = array_values(array_unique($siesa[$d]['activos'] ?? []));
-            if ($f !== '799' && _u($it['cum']) !== 'VITAL NO DISPONIBLE' && count($plusActivos) > 1 && !nt_plu_varios_ok($variosAprobados, $d, $plusActivos)) {
-                $motivo('NT29', 'ERROR', "El CUM $d tiene " . count($plusActivos) . ' PLU activos en SIESA (' . implode(', ', $plusActivos) . '): debe quedar uno solo');
+            // NT29: la línea debe tener un solo PLU activo EN LA MAESTRA TARIFARIA (la MT manda, 2026-11-05); no aplica a insumos (799) ni a
+            // VITAL NO DISPONIBLE (aclaración del usuario, 2026-10-19) ni a los CUM aprobados con varios PLU
+            // También cuentan los PLU nuevos de SIESA «por definir» (activos en SIESA, aún sin decisión en la Maestra Tarifaria)
+            $plusActivos = array_map('strval', array_keys(array_filter($siesaLinea['_plus_mt'], fn($x) => $x === 1)));
+            $pend = $siesaLinea['_plus_pend'];
+            $varios = [...$plusActivos, ...$pend];
+            if ($f !== '799' && _u($it['cum']) !== 'VITAL NO DISPONIBLE' && count($varios) > 1 && !nt_plu_varios_ok($variosAprobados, $d, $varios)) {
+                $motivo('NT29', 'ERROR', "El CUM $d tiene " . count($varios) . ' PLU (' . implode(', ', $plusActivos) . ' activo' . (count($plusActivos) > 1 ? 's' : '') . ' en la Maestra Tarifaria'
+                    . ($pend ? '; ' . implode(', ', $pend) . ' nuevo en SIESA, por definir' : '')
+                    . '): dejar uno solo (inactivar el que sobra) o, si el CUM sí lleva varios, «Aprobar varios PLU»');
             }
             if ($cargaMedicar) {
                 $mx = $medLinea;
@@ -469,8 +513,13 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
         // sin reglas (la línea se sigue validando con sus demás PLU)
         if (count($porPlu) > 1) foreach ($porPlu as $plu => &$x) {
             $x['plu'] = (string) $plu;
+            $x['plu_de_varios'] = true; // fila de un PLU dentro de una línea con varios (el formulario activa / inactiva solo ese PLU)
             $x['plu_medicar'] = _nt_medicar([$plu], $d, $subplanesMed, $medPlu, $medCum)['plu_medicar'];
-            if ((int) $it['activo'] && isset($plusInactivos[(int) $it['id']][_u($plu)])) $x += ['activo' => 0, 'estado' => 'INACTIVO', 'motivos' => [], 'reglas' => '', 'plu_inactivo' => true];
+            // el PLU por definir conserva NT29 para resolverlo desde su fila (Aprobar varios PLU / Dejar inactivo)
+            $pendX = in_array((string) $plu, $siesaLinea['_plus_pend'], true);
+            $mPend = $pendX ? array_values(array_filter($m, fn($y) => $y['codigo'] === 'NT29')) : [];
+            if ((int) $it['activo'] && !$x['_mt']) $x += ['activo' => 0, 'estado' => 'INACTIVO', 'motivos' => $mPend, 'reglas' => implode(' ', array_column($mPend, 'codigo')),
+                'plu_inactivo' => true, 'plu_pendiente' => $pendX && $mPend];
         }
         unset($x, $siesaLinea['_plus'], $siesaLinea['_por_plu']);
         $filas[] = $fila + $siesaLinea + ['plu' => count($porPlu) === 1 ? (string) array_key_first($porPlu) : null, 'activo_linea' => (int) $it['activo'],
@@ -495,6 +544,17 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
             'reglas' => implode(' ', array_unique(array_column($m, 'codigo'))),
             '_por_plu' => count($porPlu) > 1 ? array_values($porPlu) : [],
         ];
+    }
+    // guarda el estado de los PLU que entraron a la Maestra Tarifaria (o que se ajustaron solos)
+    if ($pendPlu) {
+        $propia = !$pdo->inTransaction();
+        if ($propia) $pdo->beginTransaction();
+        $up = $pdo->prepare('UPDATE nt_item_plu SET activo = ?, actualizado_en = ? WHERE nt_item_id = ? AND UPPER(plu) = ?');
+        foreach ($pendPlu as [$idL, $pl, $v, $existe]) {
+            if ($existe) $up->execute([$v, ahora(), $idL, $pl]);
+            else insertar($pdo, 'nt_item_plu', ['nt_item_id' => $idL, 'plu' => $pl, 'activo' => $v, 'actualizado_por' => null, 'actualizado_en' => ahora()]);
+        }
+        if ($propia) $pdo->commit();
     }
     $faltan = [];
     foreach (['CONTRATO_EVENTO_22382' => 'Contrato Evento', 'LISTADO_CAPITA' => 'Listado Cápita', 'LISTADO_EVENTO_SAS' => 'Listado EVENTO SAS', 'MEDICAMENTOS_MUTUAL' => 'Maestra Mutual Ser',
@@ -548,12 +608,13 @@ function nt_listar(PDO $pdo, array $filtros, int $pagina, int $tam): array {
  * y los códigos RIPS tal como están en SIESA. Se prefieren los ítems activos y, entre ellos, los del COD GEN SIESA de la
  * línea (prefijo de la referencia). Sin ítem activo se muestran los demás con su estado.
  */
-function _nt_siesa_item(array $items, string $codGen): array {
-    $activos = array_values(array_filter($items, fn($r) => _u($r['estado']) === 'ACTIVO'));
-    $usar = $activos ?: $items;
-    $mismoGen = array_values(array_filter($usar, fn($r) => $codGen !== '' && explode('_', (string) $r['referencia'])[0] === $codGen));
-    if ($mismoGen) $usar = $mismoGen;
-    $refs = array_unique(array_map(fn($r) => $activos ? $r['referencia'] : $r['referencia'] . ' (' . ucfirst(strtolower((string) $r['estado'])) . ')', $usar));
+function _nt_siesa_item(array $deLinea, array $est): array {
+    // PLU que se muestran: los activos en la Maestra Tarifaria y los activos en SIESA (los inactivos en las dos son historia y no se muestran)
+    $activosMt = array_filter($deLinea, fn($p) => ($est[$p] ?? 0) === 1, ARRAY_FILTER_USE_KEY);
+    $vis = array_filter($deLinea, fn($r, $p) => ($est[$p] ?? 0) === 1 || _u($r['estado']) === 'ACTIVO', ARRAY_FILTER_USE_BOTH) ?: $deLinea;
+    $usar = array_values($activosMt ?: $vis);
+    $etq = fn($r) => $r['referencia'] . (_u($r['estado']) === 'ACTIVO' ? '' : ' (' . ucfirst(strtolower((string) $r['estado'])) . ' en SIESA)');
+    $refs = array_unique(array_map($etq, $usar));
     $rips = function (string $campo) use ($usar) {
         $v = [];
         foreach ($usar as $r) {
@@ -564,16 +625,37 @@ function _nt_siesa_item(array $items, string $codGen): array {
     };
     // cada PLU con sus propios datos: en la tabla y en el Excel va un PLU por fila (pedido del usuario, 2026-10-19)
     $porPlu = [];
-    foreach ($usar as $r) {
-        $plu = _u($r['referencia']);
-        $porPlu[$plu] ??= ['referencia_siesa' => $activos ? $r['referencia'] : $r['referencia'] . ' (' . ucfirst(strtolower((string) $r['estado'])) . ')',
+    foreach ($vis as $plu => $r) {
+        $porPlu[$plu] = ['referencia_siesa' => $etq($r),
             'ffm_rips' => trim((string) $r['ffm']) ?: null, 'umm_rips' => trim((string) $r['umm']) ?: null, 'upr_rips' => trim((string) $r['upr']) ?: null,
-            'descripcion_siesa' => trim((string) $r['descripcion']) ?: null, 'atc' => trim((string) ($r['atc'] ?? '')) ?: null];
+            'descripcion_siesa' => trim((string) $r['descripcion']) ?: null, 'atc' => trim((string) ($r['atc'] ?? '')) ?: null, '_mt' => ($est[$plu] ?? 0) === 1];
     }
     return ['_plus' => array_values(array_unique(array_map(fn($r) => _u($r['referencia']), $usar))), 'referencia_siesa' => $refs ? implode(', ', $refs) : null,
+            '_plus_mt' => array_intersect_key($est, $deLinea), // estado en la Maestra Tarifaria de todos los PLU de la línea
             'ffm_rips' => $rips('ffm'), 'umm_rips' => $rips('umm'), 'upr_rips' => $rips('upr'),
             // DESCRIPCION COMPLETA: la descripción del ítem en el Maestro SIESA (la del PLU)
             'descripcion_siesa' => $rips('descripcion'), 'atc' => $rips('atc'), '_por_plu' => $porPlu];
+}
+
+/**
+ * PLU de SIESA que son de la línea: los activos en SIESA (o todos, si no hay activos), prefiriendo los del COD GEN SIESA de la línea
+ * (prefijo de la referencia), y los que están activos en la Maestra Tarifaria aunque SIESA los tenga inactivos. [PLU => ítem de SIESA]
+ */
+function _nt_plus_de_linea(array $items, string $codGen, array $est): array {
+    $activos = array_values(array_filter($items, fn($r) => _u($r['estado']) === 'ACTIVO'));
+    $usar = $activos ?: $items;
+    $mismoGen = array_values(array_filter($usar, fn($r) => $codGen !== '' && explode('_', (string) $r['referencia'])[0] === $codGen));
+    if ($mismoGen) $usar = $mismoGen;
+    $out = [];
+    foreach ($usar as $r) $out[_u($r['referencia'])] ??= $r;
+    foreach ($items as $r) if (($est[_u($r['referencia'])] ?? 0) === 1) $out[_u($r['referencia'])] ??= $r;
+    return $out;
+}
+
+/** PLU principal de una línea sin PLU activo: el del COD AUF / COD GEN de la línea (prefijo) o el primero. */
+function _nt_plu_principal(array $plus, array $prefijos): string {
+    foreach ($plus as $p) if (in_array(explode('_', (string) $p)[0], array_filter($prefijos), true)) return (string) $p;
+    return (string) $plus[0];
 }
 
 /**
@@ -618,10 +700,11 @@ function _nt_medicar(array $plus, string $cum, array $subplanes, array $medPlu, 
 const NT_FILTRABLES = ['contrato_vista', 'cum', 'cum_facturar', 'fecha', 'cod_auf', 'tipo_producto', 'descripcion', 'cod_gen_siesa', 'cod_mutual',
     'referencia_siesa', 'descripcion_siesa', 'atc', 'ffm_rips', 'umm_rips', 'upr_rips', 'medicar', 'plu_medicar', 'subplan', 'clasificacion',
     'precio_venta', 'iva', 'contrato', 'en_contrato', 'precio_correcto', 'cum_codigo', 'estado', 'reglas',
-    'precio_final', 'precio_contrato', 'precio_maximo', 'precio_regulado', 'cumple_regulado', 'tarifa_capita', 'precio_capita_ok'];
+    'precio_final', 'precio_contrato', 'precio_maximo', 'precio_regulado', 'cumple_regulado', 'tarifa_capita', 'precio_capita_ok', 'activo_estado'];
 
 /** Valor de una celda para filtrar y listar (precios sin decimales, vacío = ""). */
 function _nt_celda(array $f, string $k): string {
+    if ($k === 'activo_estado') return (int) ($f['activo'] ?? 0) ? 'ACTIVO' : 'INACTIVO'; // columna ESTADO: la línea o, en su fila, el PLU
     $v = $f[$k] ?? null;
     if ($v === null) return '';
     if (in_array($k, ['precio_venta', 'precio_final', 'precio_contrato', 'precio_maximo', 'precio_regulado'], true)) return (string) round((float) $v);
@@ -1138,40 +1221,50 @@ function nt_activar_masivo(PDO $pdo, array $claves, ?array $filtros, bool $activ
     }
     if (!$porLinea) throw new ErrorApi('No hay líneas seleccionadas.', 422);
     if (array_sum(array_map('count', $porLinea)) > 20000) throw new ErrorApi('Son demasiadas líneas para una sola operación.', 422);
-    $plusDe = []; // PLU de cada línea (los de sus filas por PLU)
-    foreach ($calc as $f) $plusDe[(int) $f['id']] = array_map(fn($p) => _u((string) $p), array_column($f['_por_plu'] ?? [], 'plu'));
-    $inactivos = nt_plus_inactivos($pdo);
+    $plusDe = []; // estado en la Maestra Tarifaria de los PLU de cada línea
+    $pendDe = []; $pluCum = []; $cumDe = []; // PLU por definir de cada línea y, por CUM y PLU, las líneas que tienen ese PLU
+    foreach ($calc as $f) {
+        $plusDe[(int) $f['id']] = $f['_plus_mt'] ?? []; $pendDe[(int) $f['id']] = $f['_plus_pend'] ?? [];
+        $cumDe[(int) $f['id']] = _u($f['cum_facturar']);
+        foreach (array_keys($f['_plus_mt'] ?? []) as $p) $pluCum[_u((string) $p)][] = (int) $f['id']; // todas las líneas que tienen el PLU
+    }
+    // La inactivación es por PLU (aclaración del usuario, 2026-11-05): el PLU se activa / inactiva en TODAS las líneas que lo tienen
+    // (todos sus contratos y, por lo tanto, todos sus subplanes de MEDICAR)
+    foreach ($porLinea as $id => $elegidos) foreach (array_keys($elegidos) as $p) {
+        if ((string) $p === '') continue;
+        foreach ($pluCum[(string) $p] ?? [] as $otra) $porLinea[$otra][(string) $p] = true;
+    }
     $nuevo = $activar ? 1 : 0;
     $cambiadas = 0; $sinCambio = 0;
     $sel = $pdo->prepare('SELECT id, activo FROM nt_item WHERE id = ?');
     $upd = $pdo->prepare('UPDATE nt_item SET activo = ?, actualizado_en = ?, actualizado_por = ? WHERE id = ?');
-    $borrar = $pdo->prepare('DELETE FROM nt_item_plu WHERE nt_item_id = ?');
+    $updPlu = $pdo->prepare('UPDATE nt_item_plu SET activo = ?, actualizado_por = ?, actualizado_en = ? WHERE nt_item_id = ? AND UPPER(plu) = ?');
     foreach ($porLinea as $id => $elegidos) {
         $sel->execute([$id]); $a = $sel->fetch();
         if (!$a) continue;
-        $plus = $plusDe[$id] ?? [];
-        if (count($plus) <= 1 || isset($elegidos[''])) { // la línea completa: todos sus PLU quedan igual
-            if ((int) $a['activo'] === $nuevo && empty($inactivos[$id])) { $sinCambio++; continue; }
-            $upd->execute([$nuevo, ahora(), $usuarioId, $id]);
-            $borrar->execute([$id]);
+        $mt = $plusDe[$id] ?? [];
+        $plus = array_map('strval', array_keys($mt));
+        if (count($plus) <= 1 || isset($elegidos[''])) { // la línea completa (sin PLU o con uno solo): la línea y su PLU
+            if ((int) $a['activo'] === $nuevo && !array_filter($mt, fn($v) => $v !== $nuevo)) { $sinCambio++; continue; }
+            if ((int) $a['activo'] !== $nuevo) $upd->execute([$nuevo, ahora(), $usuarioId, $id]);
+            foreach ($mt as $p => $v) if ($v !== $nuevo) $updPlu->execute([$nuevo, $usuarioId, ahora(), $id, (string) $p]);
             auditar($usuarioId, 'NT_EDITAR', 'nt_item', $id, ['activo' => (int) $a['activo']], ['activo' => $nuevo, 'motivo' => $motivo, 'masivo' => true]);
             $cambiadas++;
             continue;
         }
         // por PLU: estado actual de cada PLU, cambio de los elegidos; la línea queda activa si le queda algún PLU activo
         $estado = [];
-        foreach ($plus as $p) $estado[$p] = (int) $a['activo'] === 1 && !isset($inactivos[$id][$p]);
+        foreach ($plus as $p) $estado[$p] = (int) $a['activo'] === 1 && ($mt[$p] ?? 0) === 1;
         $antes = $estado;
         foreach (array_keys($elegidos) as $p) if (isset($estado[$p])) $estado[$p] = (bool) $nuevo;
-        $cambio = array_keys(array_filter($estado, fn($v, $p) => $v !== $antes[$p], ARRAY_FILTER_USE_BOTH));
+        $pendL = array_fill_keys($pendDe[$id] ?? [], true);
+        $cambio = array_keys(array_filter($estado, fn($v, $p) => $v !== $antes[$p] || (isset($elegidos[$p]) && isset($pendL[$p])), ARRAY_FILTER_USE_BOTH));
         $sinCambio += count(array_intersect_key($elegidos, $estado)) - count($cambio);
         if (!$cambio) continue;
+        foreach ($cambio as $p) $updPlu->execute([(int) $estado[$p], $usuarioId, ahora(), $id, (string) $p]); // queda definido por el usuario
         $lineaActiva = in_array(true, $estado, true) ? 1 : 0;
         if ($lineaActiva !== (int) $a['activo']) $upd->execute([$lineaActiva, ahora(), $usuarioId, $id]);
-        $borrar->execute([$id]);
-        if ($lineaActiva) foreach ($estado as $p => $v) {
-            if (!$v) insertar($pdo, 'nt_item_plu', ['nt_item_id' => $id, 'plu' => $p, 'activo' => 0, 'actualizado_por' => $usuarioId, 'actualizado_en' => ahora()]);
-        }
+        foreach ($estado as $p => $v) if ((int) $v !== ($mt[$p] ?? -1)) $updPlu->execute([(int) $v, $usuarioId, ahora(), $id, (string) $p]);
         foreach ($cambio as $p) {
             auditar($usuarioId, 'NT_EDITAR', 'nt_item', $id, ['activo' => (int) $antes[$p], 'plu' => $p],
                 ['activo' => $nuevo, 'plu' => $p, 'linea_activa' => $lineaActiva, 'motivo' => $motivo, 'masivo' => true]);
@@ -1203,7 +1296,7 @@ function nt_guardar(PDO $pdo, array $d, int $usuarioId): array {
         $sets = implode(', ', array_map(fn($k) => "$k = ?", array_keys($cambios)));
         $pdo->prepare("UPDATE nt_item SET $sets, actualizado_en = ?, actualizado_por = ? WHERE id = ?")
             ->execute([...array_values($cambios), ahora(), $usuarioId, $id]);
-        if (array_key_exists('activo', $cambios)) $pdo->prepare('DELETE FROM nt_item_plu WHERE nt_item_id = ?')->execute([$id]); // la línea completa: todos sus PLU
+        // la línea completa: sus PLU conservan su estado en la Maestra Tarifaria (al reactivarla sin ningún PLU activo se toman los de SIESA)
         auditar($usuarioId, 'NT_EDITAR', 'nt_item', $id, array_intersect_key($antes, $cambios), $cambios);
         return ['id' => $id, 'cambios' => count($cambios)];
     }
