@@ -188,7 +188,7 @@ function sol_autocompletar(PDO $pdo, string $codAuf, string $cum): array {
         $ci = _carga_vigente($pdo, 'INVIMA');
         $st = $pdo->prepare('SELECT c.cum, c.estado_cum, c.registro_sanitario, c.estado_registro, c.producto, c.titular, r.fecha_vencimiento
                                FROM ref_invima_cum c LEFT JOIN ref_invima_registro r ON r.carga_id = c.carga_id AND r.registro_sanitario = c.registro_sanitario
-                              WHERE c.carga_id = ? AND c.cum = ? ORDER BY id LIMIT 1');
+                              WHERE c.carga_id = ? AND c.cum = ? ORDER BY c.id LIMIT 1');
         $st->execute([$ci, $c]);
         $r['invima'] = $st->fetch() ?: null;
         $st = $pdo->prepare('SELECT id_mutual, codigo_atc, codigo_ium, nombre_comercial, medicamento FROM ref_medicamentos_mutual WHERE carga_id = ? AND cum = ? ORDER BY id LIMIT 1');
@@ -278,7 +278,7 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
     $invima = [];
     foreach ($q("SELECT c.cum, c.estado_cum, c.registro_sanitario, c.estado_registro, r.fecha_vencimiento FROM ref_invima_cum c
                   LEFT JOIN ref_invima_registro r ON r.carga_id = c.carga_id AND r.registro_sanitario = c.registro_sanitario
-                 WHERE c.carga_id = ? AND c.cum IN ($enCums) ORDER BY id", [_carga_vigente($pdo, 'INVIMA'), ...$cums]) as $r) $invima[_u($r['cum'])] = $r;
+                 WHERE c.carga_id = ? AND c.cum IN ($enCums) ORDER BY c.id", [_carga_vigente($pdo, 'INVIMA'), ...$cums]) as $r) $invima[_u($r['cum'])] = $r;
     $capita = array_fill_keys(array_map('_u', $q('SELECT codigo_cup FROM ref_capita WHERE carga_id = ? ORDER BY id', [_carga_vigente($pdo, 'LISTADO_CAPITA')])->fetchAll(PDO::FETCH_COLUMN)), true);
     $sasCum = []; $sasCod = [];
     foreach ($q('SELECT cod_audifarma, cum FROM ref_evento_sas WHERE carga_id = ? ORDER BY id', [_carga_vigente($pdo, 'LISTADO_EVENTO_SAS')]) as $r) {
