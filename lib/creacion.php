@@ -41,7 +41,11 @@ function cre_crear(PDO $pdo, array $ids, int $usuarioId, $consecutivo = null): a
     $st->execute([$loteId]);
     $items = $st->fetchAll();
     if ($ids) $items = array_values(array_filter($items, fn($i) => in_array((int) $i['id'], $ids, true)));
-    if (!$items) throw new ErrorApi('No hay productos sin error para crear. Revise el semáforo.', 422);
+    // (2026-11-11) los productos con algo pendiente de aprobación del Administrador (A09) no se crean todavía
+    $enEspera = array_fill_keys(array_map('intval', $pdo->query("SELECT DISTINCT lote_item_id FROM proc_resultado WHERE regla_codigo = 'A09'")->fetchAll(PDO::FETCH_COLUMN)), true);
+    $esperan = count(array_filter($items, fn($i) => isset($enEspera[(int) $i['id']])));
+    $items = array_values(array_filter($items, fn($i) => !isset($enEspera[(int) $i['id']])));
+    if (!$items) throw new ErrorApi($esperan ? "Los $esperan productos sin error esperan la aprobación del Administrador (A09): se crean cuando apruebe." : 'No hay productos sin error para crear. Revise el semáforo.', 422);
     $ids = array_map(fn($i) => (int) $i['id'], $items);
     $marcas = implode(',', array_fill(0, count($ids), '?'));
 

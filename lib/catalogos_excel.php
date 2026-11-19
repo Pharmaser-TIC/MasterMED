@@ -139,6 +139,11 @@ function catalogo_procesar_excel(PDO $pdo, string $tipo, string $ruta, string $n
                 continue;
             }
             if (count($candidatos) === 1) {
+                // corrección de código: solo si el COD AUF aún no está en uso (Maestra Tarifaria, productos, SIESA, MEDICAR) (2026-11-17)
+                if ($usos = molecula_en_uso($pdo, $candidatos[0], (string) $actual[$candidatos[0]]['codigo_medicar'])) {
+                    $err($num, 'COD GEN AUDIFARMA', $llave, "No se puede corregir el COD AUF {$candidatos[0]} a $llave: " . implode('; ', $usos) . '.');
+                    continue;
+                }
                 $existente = $actual[$candidatos[0]];
                 $corregidos[$candidatos[0]] = $num;
                 $correccion = ['antes' => $existente['cod_gen_audifarma'], 'despues' => $llave];
@@ -250,6 +255,7 @@ function catalogo_procesar_excel(PDO $pdo, string $tipo, string $ruta, string $n
             $valores = array_map(fn($x) => $x['despues'], $c['campos']);
             if (array_key_exists('actualizado_en', $antes)) $valores['actualizado_en'] = ahora();
             $set = implode(', ', array_map(fn($k) => "$k = ?", array_keys($valores)));
+            if (!empty($c['correccion_codigo'])) molecula_corregir_codigo($pdo, $antes, mb_strtoupper((string) $valores['cod_gen_audifarma']));
             $pdo->prepare("UPDATE {$d['tabla']} SET $set WHERE id = ?")->execute([...array_values($valores), $c['id']]);
             auditar($usuarioId, 'CATALOGO_EXCEL_EDITAR', $d['tabla'], $c['id'], $antes, $valores);
         }

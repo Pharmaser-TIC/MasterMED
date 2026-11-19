@@ -306,6 +306,44 @@ function migraciones_datos(PDO $pdo): array {
             $pdo->exec("DELETE FROM proc_resultado WHERE regla_codigo IN ('A04', 'NT17')");
             $pdo->exec("DELETE FROM proc_regla WHERE codigo IN ('A04', 'NT17')");
         }],
+        'M041_APROBACION_SIN_PRODUCTO' => ['Aprobaciones sin producto: el usuario de creación crea COD GEN desde el catálogo y el Administrador aprueba (pedido del usuario, 2026-11-17)', function (PDO $pdo) {
+            if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql') { $pdo->exec('ALTER TABLE proc_aprobacion MODIFY lote_item_id INT NULL'); return; }
+            // SQLite no cambia una columna: se reconstruye la tabla con los mismos datos
+            $cols = 'id, lote_item_id, tipo, clave, datos, estado, solicitado_por, solicitado_en, resuelto_por, resuelto_en, motivo';
+            $pdo->exec('CREATE TABLE proc_aprobacion_nueva (' . str_replace('{PK}', 'INTEGER PRIMARY KEY AUTOINCREMENT', esquema_tablas()['proc_aprobacion']) . ')');
+            $pdo->exec("INSERT INTO proc_aprobacion_nueva ($cols) SELECT $cols FROM proc_aprobacion");
+            $pdo->exec('DROP TABLE proc_aprobacion');
+            $pdo->exec('ALTER TABLE proc_aprobacion_nueva RENAME TO proc_aprobacion');
+        }],
+        'M040_FLUJO_APROBACIONES' => ['Flujo de creación: lo nuevo lo crea el usuario de creación y el Administrador solo aprueba o rechaza; NT23 retirada; NT13 a error (decisión del usuario, 2026-11-11)', function (PDO $pdo) {
+            $pdo->exec("DELETE FROM proc_regla WHERE codigo = 'NT23' AND personalizada = 0");
+            $pdo->exec("UPDATE proc_regla SET severidad = 'ERROR', accion_sugerida = 'Crear el COD AUF en el catálogo COD GEN' WHERE codigo = 'NT13'");
+            $pdo->prepare('UPDATE proc_regla SET descripcion = ?, accion_sugerida = ? WHERE codigo = ?')->execute(['Maestra Tarifaria: inactiva en SIESA y en MEDICAR (también con registro no vigente)',
+                'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)', 'NT27']);
+            $pdo->prepare('UPDATE proc_regla SET accion_sugerida = ? WHERE codigo = ?')->execute(['Revisar con INVIMA; si INVIMA está bien, el Administrador aprueba «Actualizar con INVIMA»', 'NT31']);
+        }],
+        'M039_REGLAS_MT_MANDA' => ['Reglas alineadas con «la Maestra Tarifaria manda» y el flujo contrato → Maestra Tarifaria → SIESA / MEDICAR (pedido del usuario, 2026-11-11)', function (PDO $pdo) {
+            $st = $pdo->prepare('UPDATE proc_regla SET descripcion = ?, base_comparada = ?, accion_sugerida = ? WHERE codigo = ?');
+            foreach ([
+                ['Registro sanitario / CUM no vigente en INVIMA (si el CUM no está en INVIMA, vale el registro completado en la Maestra Tarifaria)', 'INVIMA / Maestra Tarifaria', 'Verificar el registro en INVIMA o completarlo en la Maestra Tarifaria', 'E09'],
+                ['El producto está en el contrato pero aún no en la Maestra Tarifaria', 'Maestra Tarifaria', 'Solicitud al Administrador para incluirlo en la Maestra Tarifaria', 'E10'],
+                ['El producto no está en el contrato (no se incluye en la Maestra Tarifaria hasta que esté)', 'Contrato Evento / Listados', 'PTE POR INCLUIR EN EL CONTRATO', 'E11'],
+                ['La línea de la Maestra Tarifaria tiene errores', 'Maestra Tarifaria', 'Corregir primero la línea de la Maestra Tarifaria', 'E12'],
+                ['Maestra Tarifaria: CUM no encontrado en INVIMA', 'INVIMA', 'Completar el registro sanitario y su estado en la Maestra Tarifaria o validar el CUM a mano', 'NT10'],
+                ['Maestra Tarifaria: CUM activo con registro no vigente y la línea sigue activa en la Maestra Tarifaria', 'INVIMA', 'Inactivar en la Maestra Tarifaria (Inconsistencias pide luego inactivarlo en SIESA y MEDICAR)', 'NT11'],
+                ['Maestra Tarifaria: CUM inactivo con registro vencido y la línea sigue activa en la Maestra Tarifaria', 'INVIMA', 'Inactivar en la Maestra Tarifaria (Inconsistencias pide luego inactivarlo en SIESA y MEDICAR)', 'NT24'],
+                ['Maestra Tarifaria: el código Medicar del catálogo COD GEN no coincide con el prefijo del PLU en SIESA', 'COD GEN / Maestro SIESA', 'Revisar el código Medicar en el catálogo COD GEN (el PLU de SIESA no se cambia)', 'NT14'],
+                ['Maestra Tarifaria: la línea no está creada en MEDICAR en el subplán de su contrato', 'Maestra MEDICAR', 'Crear el producto en MEDICAR', 'NT26'],
+                ['Maestra Tarifaria: sin PLU en SIESA ni en MEDICAR', 'Maestro SIESA / Maestra MEDICAR', 'Crear el producto (Crear productos) o, si la línea ya no se usa, retirarla de la Maestra Tarifaria', 'NT30'],
+            ] as $r) $st->execute($r);
+            // reglas que no se evalúan en ninguna parte (E02, A01, A02, A03, A06) y NT12 (el IVA distinto de SIESA va solo a Inconsistencias)
+            $pdo->exec("DELETE FROM proc_regla WHERE codigo IN ('E02', 'A01', 'A02', 'A03', 'A06', 'NT12') AND personalizada = 0");
+            // E11 vuelve a usarse (M021 la había retirado porque E10 cubría los dos casos): «no está en el contrato» bloquea la inclusión
+            $pdo->exec("UPDATE proc_regla SET activa = 1, severidad = 'ERROR' WHERE codigo = 'E11'");
+            // regla personalizada del ATC: el ATC ahora se completa en la Maestra Tarifaria (Inconsistencias lo lleva a SIESA)
+            $pdo->exec("UPDATE proc_regla SET accion_sugerida = 'Completar el ATC en la Maestra Tarifaria (Inconsistencias lo lleva a SIESA)'
+                        WHERE personalizada = 1 AND campo = 'atc' AND UPPER(accion_sugerida) LIKE '%SIESA%'");
+        }],
         'M038_NT31_SOLO_EN_INVIMA' => ['NT31 solo aplica si el CUM está en INVIMA (pedido del usuario, 2026-11-05)', function (PDO $pdo) {
             $pdo->prepare('UPDATE proc_regla SET descripcion = ? WHERE codigo = ?')
                 ->execute(['Maestra Tarifaria: el registro sanitario o su estado, editado en la Maestra Tarifaria, no coincide con INVIMA (si el CUM no está en INVIMA no aplica)', 'NT31']);
@@ -516,25 +554,21 @@ function semilla_reglas(PDO $pdo): void {
     $r = [
         // ERROR: bloquea la creación
         ['E01', 'Campo obligatorio vacío',                                        'ERROR',  'Formulario',          'Diligenciar el campo'],
-        ['E02', 'Valor fuera de la lista permitida',                              'ERROR',  'Catálogos',           'Seleccionar un valor de la lista'],
         ['E03', 'Código genérico Audifarma no existe en COD GEN',                 'ERROR',  'COD GEN',             'Verificar el código o crearlo en COD GEN'],
         ['E04', 'Laboratorio no existe en el catálogo',                           'ERROR',  'Laboratorios',        'Crear el laboratorio (Administrador) o corregir el nombre'],
         ['E05', 'Presentación / unidad de orden no existe en el catálogo',        'ERROR',  'Presentaciones',      'Crear la presentación (Administrador) o corregirla'],
         ['E06', 'El producto ya se encuentra creado (PLU existe en Maestro SIESA)','ERROR', 'Maestro SIESA',       'No es posible realizar nuevamente la creación'],
         ['E07', 'El producto ya se encuentra creado en el aplicativo',            'ERROR',  'Productos creados',   'No es posible realizar nuevamente la creación'],
         ['E08', 'El CUM ya está ACTIVO en Maestro SIESA',                         'ERROR',  'Maestro SIESA',       'Revisar si corresponde a una actualización'],
-        ['E09', 'Registro sanitario / CUM no vigente en INVIMA',                  'ERROR',  'INVIMA',              'Verificar el registro en INVIMA'],
-        ['E10', 'ID MUTUAL no encontrado en la Maestra Tarifaria para el CUM',         'ERROR',  'Maestra Tarifaria',        'Solicitar la inclusión en la Maestra Tarifaria'],
-        ['E11', 'El ítem no está en el contrato (Maestra Tarifaria)',                  'ERROR',  'Maestra Tarifaria',        'PTE POR INCLUIR EN EL CONTRATO'],
-        ['E12', 'Más de una fila de Maestra Tarifaria para el mismo ID MUTUAL',        'ERROR',  'Maestra Tarifaria',        'Depurar la Maestra Tarifaria'],
+        ['E09', 'Registro sanitario / CUM no vigente en INVIMA (si el CUM no está en INVIMA, vale el registro completado en la Maestra Tarifaria)', 'ERROR', 'INVIMA / Maestra Tarifaria', 'Verificar el registro en INVIMA o completarlo en la Maestra Tarifaria'],
+        ['E10', 'El producto está en el contrato pero aún no en la Maestra Tarifaria', 'ERROR', 'Maestra Tarifaria', 'Solicitud al Administrador para incluirlo en la Maestra Tarifaria'],
+        ['E11', 'El producto no está en el contrato (no se incluye en la Maestra Tarifaria hasta que esté)', 'ERROR', 'Contrato Evento / Listados', 'PTE POR INCLUIR EN EL CONTRATO'],
+        ['E12', 'La línea de la Maestra Tarifaria tiene errores', 'ERROR', 'Maestra Tarifaria', 'Corregir primero la línea de la Maestra Tarifaria'],
         ['E13', 'Precio vacío o igual a 1 sin excepción aprobada',                'ERROR',  'Maestra Tarifaria',        'El Administrador debe aprobar la excepción con motivo'],
         ['E14', 'Código de producto repetido dentro del mismo lote',              'ERROR',  'Lote',                'Eliminar la fila duplicada'],
         ['E15', 'Subplán sin ID en el catálogo de subplanes',                     'ERROR',  'Subplanes',           'Crear el subplán (Administrador)'],
         ['E16', 'Código RIPS no existe o no está habilitado',                     'ERROR',  'Tablas RIPS',         'Seleccionar un código RIPS válido'],
         // ALERTA: requiere revisión / aprobación del usuario
-        ['A01', 'La descripción supera el largo permitido y será recortada',      'ALERTA', 'Parámetros SIESA',    'Revisar el texto recortado'],
-        ['A02', 'Registro INVIMA próximo a vencer',                               'ALERTA', 'INVIMA',              'Confirmar vigencia'],
-        ['A03', 'Molécula ya existe en Medicar (no se incluye en formato 1)',     'ALERTA', 'Moléculas Medicar',   'Ninguna: se omite automáticamente'],
         // Maestra Tarifaria (fase 4): las calcula el motor sobre cada fila de la Maestra Tarifaria
         ['NT01', 'Maestra Tarifaria: el COD MUTUAL no está en el contrato',                     'ERROR',  'Contrato Evento', 'Incluir en el contrato o corregir el código'],
         ['NT02', 'Maestra Tarifaria: el precio M supera el precio del contrato (glosa de tarifa)', 'ERROR', 'Contrato Evento', 'Bajar el precio de venta de las filas indicadas al del contrato'],
@@ -542,7 +576,6 @@ function semilla_reglas(PDO $pdo): void {
         ['NT19', 'Maestra Tarifaria: el precio M no es igual a la tarifa pactada del Listado Cápita', 'ERROR', 'Listado Cápita', 'Igualar el precio de venta a la tarifa de cápita'],
         ['NT20', 'Maestra Tarifaria: la tarifa de cápita supera el precio regulado',            'ERROR',  'Listado Cápita',        'Revisar la tarifa con el contrato'],
         ['NT21', 'Maestra Tarifaria: el ID MUTUAL del Listado EVENTO SAS no es el COD MUTUAL de la Maestra Tarifaria', 'ALERTA', 'Listado EVENTO SAS', 'Corregir el COD MUTUAL en la Maestra Tarifaria o en el listado'],
-        ['NT23', 'Maestra Tarifaria: el ID MUTUAL del Listado Cápita no es el COD MUTUAL de la Maestra Tarifaria', 'ALERTA', 'Listado Cápita', 'Corregir el COD MUTUAL en la Maestra Tarifaria o en el listado'],
         ['E18', 'El CUM ya está creado en SIESA pero inactivo',                    'ERROR',  'Maestro SIESA',       'Activar el PLU en SIESA: el producto ya existe, no se crea de nuevo'],
         ['E17', 'COD GEN con POS / NO POS en «ASIGNAR»',                           'ERROR',  'COD GEN',             'Asignar POS / NO POS (lo aprueba el Administrador)'],
         ['A08', 'Fecha o estado INVIMA distinto al de INVIMA',                     'ALERTA', 'INVIMA',              'Se llenan solos desde INVIMA: revisar el cambio'],
@@ -552,22 +585,21 @@ function semilla_reglas(PDO $pdo): void {
         ['NT05', 'Maestra Tarifaria: el CUM no está enlazado con ese COD MUTUAL',               'ERROR',  'Maestra Mutual Ser',    'Corregir el código o solicitar el enlace'],
         ['NT06', 'Maestra Tarifaria: sin COD MUTUAL',                                           'ERROR',  'Maestra Tarifaria',          'Asignar el código Mutual'],
         ['NT07', 'Maestra Tarifaria: el CUM no está enlazado con ningún código (agregar)',      'ALERTA', 'Maestra Mutual Ser',    'Solicitar el enlace del CUM'],
-        ['NT10', 'Maestra Tarifaria: CUM no encontrado en INVIMA (se valida a mano)',           'ALERTA', 'INVIMA',                'Validar el CUM a mano con el botón «Validar CUM»'],
-        ['NT11', 'Maestra Tarifaria: CUM activo con registro no vigente y activo en SIESA o MEDICAR', 'ERROR', 'INVIMA / SIESA / MEDICAR', 'No se puede dispensar ni comprar: inactivar el código en SIESA y/o MEDICAR'],
-        ['NT24', 'Maestra Tarifaria: CUM inactivo con registro vencido y todavía activo en SIESA o MEDICAR', 'ERROR', 'INVIMA / SIESA / MEDICAR', 'Inactivar el código en SIESA y/o MEDICAR'],
-        ['NT12', 'Maestra Tarifaria: IVA distinto del grupo impositivo de SIESA',               'ALERTA', 'Maestro SIESA',         'Corregir el IVA'],
-        ['NT13', 'Maestra Tarifaria: COD AUF no existe en COD GEN',                             'ALERTA', 'COD GEN',               'Corregir o crear el COD GEN'],
+        ['NT10', 'Maestra Tarifaria: CUM no encontrado en INVIMA', 'ALERTA', 'INVIMA', 'Completar el registro sanitario y su estado en la Maestra Tarifaria o validar el CUM a mano'],
+        ['NT11', 'Maestra Tarifaria: CUM activo con registro no vigente y la línea sigue activa en la Maestra Tarifaria', 'ERROR', 'INVIMA', 'Inactivar en la Maestra Tarifaria (Inconsistencias pide luego inactivarlo en SIESA y MEDICAR)'],
+        ['NT24', 'Maestra Tarifaria: CUM inactivo con registro vencido y la línea sigue activa en la Maestra Tarifaria', 'ERROR', 'INVIMA', 'Inactivar en la Maestra Tarifaria (Inconsistencias pide luego inactivarlo en SIESA y MEDICAR)'],
+        ['NT13', 'Maestra Tarifaria: COD AUF no existe en COD GEN', 'ERROR', 'COD GEN',               'Crear el COD AUF en el catálogo COD GEN'],
         ['NT25', 'Maestra Tarifaria: el CUM (o código del insumo) no está en el Maestro SIESA', 'ERROR', 'Maestro SIESA', 'Crear el producto en SIESA'],
         ['NT26', 'Maestra Tarifaria: la línea no está creada en MEDICAR en el subplán de su contrato', 'ERROR', 'Maestra MEDICAR', 'Crear el producto en MEDICAR'],
         ['NT29', 'Maestra Tarifaria: la línea tiene más de un PLU activo en la Maestra Tarifaria (no aplica a insumos 799 ni a VITAL NO DISPONIBLE)', 'ERROR', 'Maestra Tarifaria', 'Inactivar en la Maestra Tarifaria el PLU que sobra (Inconsistencias pide luego inactivarlo en SIESA y MEDICAR) o, si el CUM sí lleva varios PLU, «Aprobar varios PLU»'],
         ['NT28', 'Maestra Tarifaria: el subplán de la línea no está parametrizado (sin clasificación CAPITA / EVENTO o inactivo)', 'ALERTA', 'Subplanes', 'Parametrizar el subplán en Catálogos → Subplanes Medicar'],
-        ['NT27', 'Maestra Tarifaria: la línea está inactiva en SIESA y en MEDICAR', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)'],
-        ['NT30', 'Maestra Tarifaria: sin PLU en SIESA ni en MEDICAR', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)'],
-        ['NT31', 'Maestra Tarifaria: el registro sanitario o su estado, editado en la Maestra Tarifaria, no coincide con INVIMA (si el CUM no está en INVIMA no aplica)', 'ALERTA', 'INVIMA', 'Confirmar el dato con INVIMA o dejar el campo vacío para tomar el de INVIMA'],
-        ['NT14', 'Maestra Tarifaria: COD GEN SIESA distinto del Maestro SIESA',                 'ALERTA', 'Maestro SIESA',         'Corregir el COD GEN SIESA'],
+        ['NT27', 'Maestra Tarifaria: inactiva en SIESA y en MEDICAR (también con registro no vigente)', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)'],
+        ['NT30', 'Maestra Tarifaria: sin PLU en SIESA ni en MEDICAR', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Crear el producto (Crear productos) o, si la línea ya no se usa, retirarla de la Maestra Tarifaria'],
+        ['NT31', 'Maestra Tarifaria: el registro sanitario o su estado, editado en la Maestra Tarifaria, no coincide con INVIMA (si el CUM no está en INVIMA no aplica)', 'ALERTA', 'INVIMA', 'Revisar con INVIMA; si INVIMA está bien, el Administrador aprueba «Actualizar con INVIMA»'],
+        ['NT14', 'Maestra Tarifaria: el código Medicar del catálogo COD GEN no coincide con el prefijo del PLU en SIESA', 'ALERTA', 'COD GEN / Maestro SIESA', 'Revisar el código Medicar en el catálogo COD GEN (el PLU de SIESA no se cambia)'],
         ['NT16', 'Maestra Tarifaria: el producto está inactivo en el contrato',                 'ALERTA', 'Contrato Evento', 'Confirmar con el contrato'],
         ['A05', 'Precio 1 con excepción aprobada',                                'ALERTA', 'Maestra Tarifaria',        'Verificar la excepción'],
-        ['A06', 'ID MUTUAL distinto del código genérico Audifarma',               'ALERTA', 'Maestra Tarifaria',        'Confirmar la relación'],
+        ['A09', 'Dato nuevo pendiente de aprobación del Administrador (COD GEN, laboratorio, presentación, POS / NO POS o inclusión en la Maestra Tarifaria)', 'ALERTA', 'Aprobaciones', 'Esperar la aprobación: el producto se crea (archivos de cargue) cuando el Administrador apruebe'],
         ['A07', 'Base de referencia desactualizada',                              'ALERTA', 'Bases de referencia', 'Actualizar la base antes de crear'],
     ];
     foreach ($r as $i => [$c, $d, $s, $b, $a]) {

@@ -440,6 +440,23 @@ dialog.muy-ancho { width: min(1180px, calc(100vw - 32px)); }
 .tabla-crear .filtro-btn { min-width: 0; max-width: 100%; }
 .tabla-crear th.filtro { padding: 4px 4px; }
 .tabla-crear th, .tabla-crear td { padding-left: 6px; padding-right: 6px; }
+/* lista de chequeo para quitar (2026-11-17): la casilla corre las columnas una posición */
+.tabla-crear.con-check thead tr:first-child th:nth-child(1) { width: 34px; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(2) { width: 108px; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(3) { width: 68px; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(5) { width: 104px; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(6) { width: 12%; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(7) { width: 10%; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(8) { width: 112px; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(9) { width: 13%; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(10) { width: 76px; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(1) { width: 34px; text-align: center; }
+.tabla-crear.con-check thead tr:first-child th:nth-child(4) { width: auto; }
+.tabla-crear .col-check { text-align: center; }
+.tabla-crear input[type=checkbox] { width: 16px; height: 16px; cursor: pointer; vertical-align: middle; }
+.resumen-estados .espacio { flex: 1; }
+.btn.peligro { color: var(--error); border-color: var(--error); }
+.btn.peligro:hover { background: var(--error-fondo); }
 /* Aprobaciones pendientes: tarjetas */
 .aprob-lista { display: grid; gap: 10px; max-height: calc(100vh - 300px); overflow-y: auto; padding: 2px; }
 .aprob-tarjeta { border: 1px solid var(--borde); border-left: 4px solid var(--acento); border-radius: 10px; padding: 12px 14px; background: #fff; display: grid; gap: 10px; }

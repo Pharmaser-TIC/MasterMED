@@ -501,7 +501,7 @@ function esquema_tablas(): array {
         // presentación, asignar POS / NO POS (COD GEN en «ASIGNAR») e incluir el producto en la Maestra Tarifaria.
         'proc_aprobacion' => "
             id {PK},
-            lote_item_id INT NOT NULL,
+            lote_item_id INT NULL,
             tipo VARCHAR(20) NOT NULL,
             clave VARCHAR(150) NOT NULL,
             datos TEXT,
@@ -767,6 +767,10 @@ function esquema_columnas_nuevas(): array {
         // La Maestra Tarifaria manda: si no coinciden con SIESA salen en Inconsistencias; si no coinciden con INVIMA, alerta NT31.
         // Clasificación de entrega del COD GEN (pedido del usuario, 2026-11-05): alimenta la Maestra Tarifaria por COD AUF; no se valida con SIESA ni MEDICAR
         ['cat_molecula',            'clasificacion_entrega', 'VARCHAR(40) NULL'],
+        // Creado por el usuario de creación y pendiente de aprobación del Administrador (2026-11-11): NULL = aprobado, PENDIENTE, RECHAZADO
+        ['cat_molecula',            'aprobacion',           'VARCHAR(12) NULL'],
+        ['cat_laboratorio',         'aprobacion',           'VARCHAR(12) NULL'],
+        ['cat_presentacion',        'aprobacion',           'VARCHAR(12) NULL'],
         ['nt_item',                 'atc_mt',               'VARCHAR(120) NULL'],
         ['nt_item',                 'registro_mt',          'VARCHAR(80) NULL'],
         ['nt_item',                 'estado_registro_mt',   'VARCHAR(60) NULL'],

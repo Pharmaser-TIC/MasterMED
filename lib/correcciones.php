@@ -186,6 +186,7 @@ const COR_CAMPOS_MEDICAR = [
     'CUM'       => ['CUM distinto', 'OBSERVACION', null],
     'SUBPLAN'   => ['PLU sin el subplán de la línea', 'OBSERVACION', null],
     'TRANSFERENCIA' => ['Falta en TRANSFERENCIA DE PENDIENTES', 'OBSERVACION', null],
+    'TRANSF_NO_PBS' => ['NO PBS activo en TRANSFERENCIA DE PENDIENTES', 'OBSERVACION', null],
     'ESTADO'    => ['Estado (Opción Cadena)', 'OBSERVACION', null],
     'IVA'       => ['%Iva', 'OBSERVACION', null],
     'PRECIO'    => ['Precio Unidad Mínima con IVA', 'OBSERVACION', null],
@@ -241,7 +242,14 @@ function cor_calcular_medicar(PDO $pdo): array {
     $invima = _cor_invima($pdo);
     $variosAprobados = nt_plu_varios_aprobados($pdo); // CUM aprobados con varios PLU activos
     $out = [];
-    foreach (nt_calcular($pdo)['filas'] as $l) {
+    $lineas = nt_calcular($pdo)['filas'];
+    // PLU que alguna línea EVENTO POS del Contrato Evento necesita en TRANSFERENCIA: a esos no se les pide inactivarlo (2026-11-17)
+    $plusTransfPos = [];
+    foreach ($lineas as $l) {
+        if ($l['contrato'] === 'EVENTO' && $l['en_contrato'] === 'SI' && _u($l['subplan'] ?? '') !== 'EVENTO NO PBS')
+            foreach (array_keys($l['_plus_mt'] ?? []) as $p) $plusTransfPos[_u((string) $p)] = true;
+    }
+    foreach ($lineas as $l) {
         $cf = (string) $l['cum_facturar']; $cum = _u($cf);
         $activoLinea = (int) $l['activo'] === 1;
         $activo = $activoLinea;
@@ -277,13 +285,23 @@ function cor_calcular_medicar(PDO $pdo): array {
             $activo = $activoLinea && (!$mt || ($mt[$p] ?? 0) === 1); // estado del PLU en la Maestra Tarifaria (PLU + CONTRATO)
             $filas = $medPlu[$p] ?? null;
             if (!$filas) { if ($activo) $add('PLU', $p, null, $p, "Crear en MEDICAR el PLU $p (CUM $cf) en el subplán $sp"); continue; }
-            // todo lo que está en el Contrato Evento debe estar activo en MEDICAR en TRANSFERENCIA DE PENDIENTES (decisión del usuario, 2026-10-19)
-            if ($activo && $l['contrato'] === 'EVENTO' && $l['en_contrato'] === 'SI' && !$variosSiesa) {
+            // todo lo que está en el Contrato Evento debe estar activo en MEDICAR en TRANSFERENCIA DE PENDIENTES (decisión del usuario, 2026-10-19),
+            // salvo lo NO PBS: va solo en EVENTO NO PBS, no en TRANSFERENCIA (decisión del usuario, 2026-11-17)
+            if ($activo && $l['contrato'] === 'EVENTO' && $l['en_contrato'] === 'SI' && !$variosSiesa && _u($sp) !== 'EVENTO NO PBS') {
                 $tr = $filas[COR_SUBPLAN_TRANSFERENCIA] ?? null;
                 if (!$tr || trim((string) $tr['opcion']) !== '1') {
                     $out["MEDICAR|$cf|$p|" . COR_SUBPLAN_TRANSFERENCIA . '|TRANSFERENCIA'] = ['cum_facturar' => $cf, 'plu' => $p, 'item' => null, 'contratos' => $contrato,
                         'subplan' => COR_SUBPLAN_TRANSFERENCIA, 'campo' => 'TRANSFERENCIA', 'actual' => $tr ? 'Inactivo (9)' : 'No está', 'esperado' => 'Activo (1)', 'revision' => false,
                         'accion' => ($tr ? 'Activar' : 'Crear') . " el PLU $p en el subplán " . COR_SUBPLAN_TRANSFERENCIA . ' (está en el Contrato Evento)'];
+                }
+            }
+            // lo NO PBS del Contrato Evento va solo en EVENTO NO PBS: si está activo en TRANSFERENCIA, inactivarlo (decisión del usuario, 2026-11-17)
+            if ($l['contrato'] === 'EVENTO' && $l['en_contrato'] === 'SI' && _u($sp) === 'EVENTO NO PBS' && !isset($plusTransfPos[_u($p)])) {
+                $tr = $filas[COR_SUBPLAN_TRANSFERENCIA] ?? null;
+                if ($tr && trim((string) $tr['opcion']) === '1') {
+                    $out["MEDICAR|$cf|$p|" . COR_SUBPLAN_TRANSFERENCIA . '|TRANSF_NO_PBS'] = ['cum_facturar' => $cf, 'plu' => $p, 'item' => null, 'contratos' => $contrato,
+                        'subplan' => COR_SUBPLAN_TRANSFERENCIA, 'campo' => 'TRANSF_NO_PBS', 'actual' => 'Activo (1)', 'esperado' => 'Inactivo (9)', 'revision' => false,
+                        'accion' => "Inactivar el PLU $p en el subplán " . COR_SUBPLAN_TRANSFERENCIA . ' (es NO PBS: va solo en EVENTO NO PBS)'];
                 }
             }
             $m = $filas[_u($sp)] ?? null;
@@ -349,7 +367,9 @@ function cor_exportar_medicar(PDO $pdo, array $cond, array $params, int $usuario
     $id = insertar($pdo, 'cor_exportacion', ['sistema' => 'MEDICAR', 'filas' => count($filas), 'carga_id' => $carga, 'usuario_id' => $usuarioId, 'creado_en' => ahora()]);
     $nombre = 'CORRECCIONES MEDICAR ' . str_pad((string) $id, 5, '0', STR_PAD_LEFT) . ' - ' . date('Ymd') . '.xlsx';
     $ruta = rtrim(app_config()['dir_salidas'], '/\\') . '/' . $nombre;
-    XlsxWriter::guardar($ruta, [['nombre' => 'Correcciones', 'encabezados' => ['PLU', 'OBSERVACION'], 'filas' => $datos]]);
+    [$encDet, $filasDet] = cor_tabla_hoja($pdo, 'MEDICAR', $filas);
+    XlsxWriter::guardar($ruta, [['nombre' => 'Correcciones', 'encabezados' => ['PLU', 'OBSERVACION'], 'filas' => $datos],
+                                ['nombre' => 'Detalle', 'encabezados' => $encDet, 'filas' => $filasDet]]); // detalle completo para corregir (2026-11-17)
     $archivos = [['nombre' => $nombre, 'filas' => count($datos)]];
     $pdo->prepare('UPDATE cor_exportacion SET archivos = ?, ruta = ? WHERE id = ?')->execute([json_encode($archivos, JSON_UNESCAPED_UNICODE), $ruta, $id]);
     $upd = $pdo->prepare("UPDATE cor_inconsistencia SET estado = 'PENDIENTE_ACTUALIZACION', exportacion_id = ?, carga_exportada = ?, exportado_en = ?, exportado_por = ?, actualizado_en = ? WHERE id = ?");
@@ -357,6 +377,37 @@ function cor_exportar_medicar(PDO $pdo, array $cond, array $params, int $usuario
     foreach (array_column($filas, 'id') as $x) $upd->execute([$id, $carga, $ahora, $usuarioId, $ahora, $x]);
     auditar($usuarioId, 'COR_EXPORTAR', 'cor_exportacion', $id, null, ['sistema' => 'MEDICAR', 'filas' => count($filas), 'archivos' => $archivos]);
     return ['id' => $id, 'filas' => count($filas), 'archivos' => $archivos];
+}
+
+/**
+ * Detalle completo de lo descargado (pedido del usuario, 2026-11-17): todas las columnas de la tabla de Inconsistencias, más COD AUF,
+ * descripción y COD MUTUAL de la Maestra Tarifaria, para corregir. Va dentro de la descarga (un solo botón).
+ */
+function cor_tabla_hoja(PDO $pdo, string $sistema, array $inconsistencias): array {
+    $esMed = $sistema === 'MEDICAR';
+    $mt = [];
+    foreach ($pdo->query('SELECT cum_facturar, contrato, cod_auf, descripcion, cod_mutual FROM nt_item ORDER BY activo DESC, id') as $r) {
+        $mt[_u($r['cum_facturar'])] ??= $r;
+        $mt[_u($r['cum_facturar']) . '|' . $r['contrato']] ??= $r;
+    }
+    $campos = cor_campos($sistema);
+    $cargue = ['DESCRIPCIONES' => 'Descripciones Técnicas', 'CREACION_ITEM' => 'CREACION_ITEM', 'MANUAL' => 'A mano', 'OBSERVACION' => 'PLU + observación'];
+    $filas = [];
+    foreach ($inconsistencias as $f) {
+        $cum = _u($f['cum_facturar']);
+        $m = $mt[$cum . '|' . trim((string) strtok((string) $f['contratos'], ','))] ?? $mt[$cum] ?? [];
+        $filas[] = array_merge(
+            [$f['plu']],
+            $esMed ? [] : [$f['item']],
+            [$f['cum_facturar'], $m['cod_auf'] ?? '', $m['descripcion'] ?? '', $m['cod_mutual'] ?? '', $f['contratos']],
+            $esMed ? [$f['subplan']] : [],
+            [$campos[$f['campo']][0] ?? $f['campo'], $f['valor_actual'], $f['valor_esperado'], $f['accion']],
+            $esMed ? [] : [$cargue[$f['cargue']] ?? $f['cargue']],
+            [$f['detectado_en']]);
+    }
+    $enc = array_merge(['PLU'], $esMed ? [] : ['ITEM'], ['CUM FACTURAR', 'COD AUF', 'DESCRIPCION', 'COD MUTUAL', 'CONTRATO'], $esMed ? ['SUBPLAN'] : [],
+        ['CAMPO', "VALOR EN $sistema", 'VALOR CORRECTO', $esMed ? 'OBSERVACION' : 'ACCION'], $esMed ? [] : ['SE CARGA CON'], ['DETECTADO']);
+    return [$enc, $filas];
 }
 
 /**
@@ -492,11 +543,9 @@ function cor_exportar_siesa(PDO $pdo, array $cond, array $params, int $usuarioId
     $carga = _carga_vigente($pdo, 'MAESTRO_SIESA');
     $datoMax = (int) parametro('SIESA_DATO_MAX', '60');
 
-    $desc = []; $iva = []; $manual = []; $detalle = [];
+    $desc = []; $iva = []; $manual = [];
     foreach ($filas as $f) {
         [$nombre, $cargue, $f104] = COR_CAMPOS_SIESA[$f['campo']];
-        $detalle[] = [$f['plu'], $f['item'], $f['cum_facturar'], $f['contratos'], $nombre, $f['valor_actual'], $f['valor_esperado'], $f['accion'],
-            ['DESCRIPCIONES' => 'Descripciones Técnicas', 'CREACION_ITEM' => 'CREACION_ITEM', 'MANUAL' => 'A mano'][$cargue]];
         if ($cargue === 'DESCRIPCIONES') $desc[$f['plu'] . '|' . $f104] = [$f['plu'], mb_substr((string) $f['valor_esperado'], 0, $datoMax), $f104];
         elseif ($cargue === 'CREACION_ITEM') $iva[$f['plu']] = explode(' ', (string) $f['valor_esperado'])[0];
         else $manual[] = [$f['plu'], $f['item'], $f['cum_facturar'], $nombre, $f['valor_actual'], $f['valor_esperado'], $f['accion']];
@@ -519,8 +568,8 @@ function cor_exportar_siesa(PDO $pdo, array $cond, array $params, int $usuarioId
     }
     if ($manual) $hojas['manual'] = [['PARA CORREGIR EN SIESA (A MANO).xlsx', 'Correcciones'],
         ['PLU', 'ITEM', 'CUM FACTURAR', 'CAMPO', 'VALOR EN SIESA', 'VALOR CORRECTO', 'ACCIÓN'], $manual];
-    $hojas['detalle'] = [['CORRECCIONES SIESA - DETALLE.xlsx', 'Detalle'],
-        ['PLU', 'ITEM', 'CUM FACTURAR', 'CONTRATO', 'CAMPO', 'VALOR EN SIESA', 'VALOR CORRECTO', 'ACCIÓN', 'SE CARGA CON'], $detalle];
+    [$encDet, $filasDet] = cor_tabla_hoja($pdo, 'SIESA', $filas); // todas las columnas (2026-11-17)
+    $hojas['detalle'] = [['CORRECCIONES SIESA - DETALLE.xlsx', 'Detalle'], $encDet, $filasDet];
 
     $id = insertar($pdo, 'cor_exportacion', ['sistema' => 'SIESA', 'filas' => count($filas), 'carga_id' => $carga, 'usuario_id' => $usuarioId, 'creado_en' => ahora()]);
     $dir = rtrim(app_config()['dir_salidas'], '/\\') . '/correcciones_SIESA_' . str_pad((string) $id, 5, '0', STR_PAD_LEFT);

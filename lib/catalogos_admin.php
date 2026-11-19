@@ -57,7 +57,25 @@ function codigos_medicar_repetidos(PDO $pdo): array {
     $out = [];
     foreach ($pdo->query("SELECT codigo_medicar, cod_gen_audifarma FROM cat_molecula WHERE codigo_medicar IS NOT NULL AND codigo_medicar <> '' ORDER BY codigo_medicar, cod_gen_audifarma") as $r)
         $out[(string) $r['codigo_medicar']][] = $r['cod_gen_audifarma'];
-    return array_values(array_map(fn($c, $cs) => ['codigo' => $c, 'cod_gen' => $cs], array_keys($out = array_filter($out, fn($x) => count($x) > 1)), $out));
+    $out = array_filter($out, fn($x) => count($x) > 1);
+    // COD GEN con productos (2026-11-11): tiene PLU en el Maestro SIESA o líneas en la Maestra Tarifaria. Su código Medicar es el prefijo
+    // de sus PLU y la molécula en MEDICAR: no se le asigna otro solo (cambiarlo crearía otra molécula y otro prefijo de PLU).
+    $con = [];
+    if ($out) {
+        $todos = array_values(array_unique(array_map('strtoupper', array_merge(...array_values($out)))));
+        $marcas = implode(',', array_fill(0, count($todos), '?'));
+        $st = $pdo->prepare("SELECT DISTINCT UPPER(cod_auf) FROM nt_item WHERE UPPER(cod_auf) IN ($marcas)");
+        $st->execute($todos);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $c) $con[$c] = true;
+        $carga = (int) $pdo->query("SELECT id FROM ref_carga WHERE tipo_base = 'MAESTRO_SIESA' AND vigente = 1 ORDER BY id DESC LIMIT 1")->fetchColumn();
+        if ($carga) {
+            $st = $pdo->prepare("SELECT DISTINCT UPPER(cod_gen_audifarma) FROM ref_siesa_item WHERE carga_id = ? AND UPPER(cod_gen_audifarma) IN ($marcas)");
+            $st->execute([$carga, ...$todos]);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $c) $con[$c] = true;
+        }
+    }
+    return array_values(array_map(fn($c, $cs) => ['codigo' => $c, 'cod_gen' => $cs,
+        'con_productos' => array_values(array_filter($cs, fn($x) => isset($con[strtoupper((string) $x)])))], array_keys($out), $out));
 }
 
 function siguiente_codigo_medicar(PDO $pdo): string {
@@ -188,6 +206,48 @@ function normalizar_lista(?string $v): string {
     return strtr(normalizar_texto($v), ['Á' => 'A', 'É' => 'E', 'Í' => 'I', 'Ó' => 'O', 'Ú' => 'U']);
 }
 
+/**
+ * Dónde está en uso un COD AUF (decisión del usuario, 2026-11-17): una vez está en la Maestra Tarifaria, en un producto creado o en
+ * SIESA / MEDICAR, el código queda cerrado (no se corrige, para no generar errores de creación). Antes de eso se puede corregir.
+ * Devuelve los motivos; vacío = se puede corregir.
+ */
+function molecula_en_uso(PDO $pdo, string $cod, string $codigoMedicar = ''): array {
+    $cod = mb_strtoupper(trim($cod)); $usos = [];
+    $n = function (string $sql, array $p) use ($pdo): int { $st = $pdo->prepare($sql); $st->execute($p); return (int) $st->fetchColumn(); };
+    if ($c = $n('SELECT COUNT(*) FROM nt_item WHERE UPPER(TRIM(cod_auf)) = ?', [$cod])) $usos[] = "está en la Maestra Tarifaria ($c línea" . ($c > 1 ? 's' : '') . ')';
+    elseif ($n('SELECT COUNT(*) FROM nt_quitada WHERE UPPER(TRIM(cod_auf)) = ?', [$cod])) $usos[] = 'estuvo en la Maestra Tarifaria (líneas quitadas)';
+    if ($c = $n('SELECT COUNT(*) FROM prod_producto p JOIN proc_lote_item i ON i.id = p.lote_item_id WHERE UPPER(TRIM(i.codigo_generico_audifarma)) = ?', [$cod]))
+        $usos[] = "tiene $c producto" . ($c > 1 ? 's creados' : ' creado');
+    if ($codigoMedicar !== '' && $n('SELECT COUNT(*) FROM prod_molecula_medicar WHERE codigo_molecula = ?', [$codigoMedicar])) $usos[] = "su código Medicar $codigoMedicar ya se envió a MEDICAR";
+    if (function_exists('_carga_vigente')) {
+        if (($k = _carga_vigente($pdo, 'MAESTRO_SIESA')) && $n('SELECT COUNT(*) FROM ref_siesa_item WHERE carga_id = ? AND UPPER(TRIM(cod_gen_audifarma)) = ?', [$k, $cod])) $usos[] = 'ya está en SIESA';
+        if (($k = _carga_vigente($pdo, 'MAESTRA_MEDICAR')) && $n('SELECT COUNT(*) FROM ref_medicar WHERE carga_id = ? AND UPPER(TRIM(codigo_generico)) = ?', [$k, $cod])) $usos[] = 'ya está en MEDICAR';
+    }
+    return $usos;
+}
+
+/** Valida la corrección de un COD AUF y la lleva a lo que aún no se ha creado: productos por crear y aprobaciones (2026-11-17). */
+function molecula_corregir_codigo(PDO $pdo, array $antes, string $nuevo): void {
+    $viejo = mb_strtoupper(trim((string) $antes['cod_gen_audifarma']));
+    if (!preg_match('/^[0-9A-Z]{1,20}$/', $nuevo)) throw new ErrorApi('El código genérico Audifarma es obligatorio (letras y números, ej. 4039M).', 422);
+    if ($o = _existe_otro($pdo, 'cat_molecula', 'UPPER(cod_gen_audifarma)', $nuevo, (int) $antes['id'])) throw new ErrorApi("El código $nuevo ya existe: {$o['descripcion_general']}.", 409);
+    if ($usos = molecula_en_uso($pdo, $viejo, (string) $antes['codigo_medicar']))
+        throw new ErrorApi("El COD AUF $viejo ya no se puede corregir: " . implode('; ', $usos) . '. Solo se corrige antes de agregarlo a la Maestra Tarifaria.', 409);
+    // productos por crear (lotes abiertos) que lo usan
+    $pdo->prepare("UPDATE proc_lote_item SET codigo_generico_audifarma = ? WHERE UPPER(TRIM(codigo_generico_audifarma)) = ? AND lote_id IN (SELECT id FROM proc_lote WHERE estado IN ('BORRADOR', 'VALIDADA'))")
+        ->execute([$nuevo, $viejo]);
+    // aprobaciones: las del COD GEN (llave = código) y lo pendiente que lo trae en sus datos
+    $st = $pdo->query("SELECT id, tipo, clave, datos, estado FROM proc_aprobacion WHERE tipo IN ('MOLECULA', 'ASIGNAR_POS') OR estado = 'PENDIENTE'");
+    $upd = $pdo->prepare('UPDATE proc_aprobacion SET clave = ?, datos = ? WHERE id = ?');
+    foreach ($st->fetchAll() as $a) {
+        $d = json_decode((string) $a['datos'], true) ?: []; $cambio = false;
+        foreach (['cod_gen_audifarma', 'cod_auf'] as $k) if (isset($d[$k]) && mb_strtoupper(trim((string) $d[$k])) === $viejo) { $d[$k] = $nuevo; $cambio = true; }
+        $clave = $a['clave'];
+        if (in_array($a['tipo'], ['MOLECULA', 'ASIGNAR_POS'], true) && mb_strtoupper(trim((string) $clave)) === $viejo) { $clave = $nuevo; $cambio = true; }
+        if ($cambio) $upd->execute([$clave, json_encode($d, JSON_UNESCAPED_UNICODE), $a['id']]);
+    }
+}
+
 function molecula_guardar(PDO $pdo, array $in, int $usuarioId): array {
     $id = (int) ($in['id'] ?? 0);
     $datos = [
@@ -227,6 +287,12 @@ function molecula_guardar(PDO $pdo, array $in, int $usuarioId): array {
 
     if ($id) {
         $antes = _fila($pdo, 'cat_molecula', $id);
+        // corrección del COD AUF: solo mientras no esté en uso (2026-11-17)
+        $codNuevo = mb_strtoupper(trim((string) ($in['cod_gen_audifarma'] ?? '')));
+        if ($antes && $codNuevo !== '' && $codNuevo !== mb_strtoupper(trim((string) $antes['cod_gen_audifarma']))) {
+            molecula_corregir_codigo($pdo, $antes, $codNuevo);
+            $datos['cod_gen_audifarma'] = $codNuevo;
+        }
         $set = implode(', ', array_map(fn($k) => "$k = ?", array_keys($datos)));
         $pdo->prepare("UPDATE cat_molecula SET $set WHERE id = ?")->execute([...array_values($datos), $id]);
     } else {

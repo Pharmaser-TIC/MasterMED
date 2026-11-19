@@ -100,6 +100,117 @@ function _sol_normalizar(array $d): array {
     return $out;
 }
 
+/**
+ * Precio propuesto por el usuario de creación para las líneas nuevas de la Maestra Tarifaria (pedido del usuario, 2026-11-11): lo digita
+ * quien crea (con la calculadora de precio de venta) y el Administrador solo lo aprueba o lo rechaza.
+ * ['cod_mutual' => …, 'lineas' => [contrato => ['precio_venta', 'origen', 'regla', 'precio_compra', 'porcentaje']]]
+ */
+function _sol_nt_propuesta($d): ?array {
+    if (!is_array($d) || !is_array($d['lineas'] ?? null)) return null;
+    $num = fn($v) => ($v = str_replace(',', '.', trim((string) ($v ?? '')))) === '' || !is_numeric($v) || (float) $v < 0 ? null : round((float) $v, 2);
+    $lineas = [];
+    foreach ($d['lineas'] as $k => $l) {
+        $k = nt_contrato((string) $k);
+        if (!$k || !is_array($l)) continue;
+        $lineas[$k] = ['precio_venta' => $num($l['precio_venta'] ?? null), 'origen' => mb_substr((string) ($l['origen'] ?? 'MANUAL'), 0, 20) ?: 'MANUAL',
+            'regla' => mb_substr((string) ($l['regla'] ?? ''), 0, 200), 'precio_compra' => $num($l['precio_compra'] ?? null), 'porcentaje' => $num($l['porcentaje'] ?? null)];
+    }
+    if (!$lineas) return null;
+    return ['cod_mutual' => mb_strtoupper(trim((string) ($d['cod_mutual'] ?? ''))) ?: null, 'lineas' => $lineas];
+}
+
+/** ¿Los datos de una aprobación son los mismos? (para no volver a enviar lo que el Administrador ya rechazó sin cambios) */
+function _sol_mismos(?string $json, array $datos): bool {
+    $a = json_decode((string) $json, true) ?: [];
+    $n = fn($x) => is_array($x) ? json_encode($x) : mb_strtoupper(trim((string) $x));
+    foreach ($datos as $k => $v) if (!str_starts_with((string) $k, '_') && $n($a[$k] ?? null) !== $n($v)) return false;
+    return true;
+}
+
+/** Última aprobación de un tipo + clave (la más reciente). */
+function _sol_ultima(PDO $pdo, string $tipo, string $clave): ?array {
+    $st = $pdo->prepare('SELECT * FROM proc_aprobacion WHERE tipo = ? AND clave = ? ORDER BY id DESC LIMIT 1');
+    $st->execute([$tipo, $clave]);
+    return $st->fetch() ?: null;
+}
+
+/** Pide (o actualiza) la aprobación pendiente de un tipo + clave. */
+function _sol_pedir(PDO $pdo, ?int $itemId, string $tipo, string $clave, array $datos, int $usuarioId): void {
+    // $itemId null: lo pidió el usuario de creación desde el catálogo, sin producto (2026-11-17)
+    $u = _sol_ultima($pdo, $tipo, $clave);
+    if ($u && $u['estado'] === 'PENDIENTE') {
+        if (!_sol_mismos($u['datos'], $datos)) $pdo->prepare('UPDATE proc_aprobacion SET datos = ?, lote_item_id = COALESCE(?, lote_item_id), solicitado_por = ?, solicitado_en = ? WHERE id = ?')
+            ->execute([json_encode($datos, JSON_UNESCAPED_UNICODE), $itemId, $usuarioId, ahora(), $u['id']]);
+        return;
+    }
+    insertar($pdo, 'proc_aprobacion', ['lote_item_id' => $itemId, 'tipo' => $tipo, 'clave' => $clave, 'datos' => json_encode($datos, JSON_UNESCAPED_UNICODE),
+        'estado' => 'PENDIENTE', 'solicitado_por' => $usuarioId, 'solicitado_en' => ahora()]);
+}
+
+/**
+ * Lo nuevo que digitó el usuario de creación se crea de una vez en el catálogo, PENDIENTE de aprobación del Administrador (pedido del
+ * usuario, 2026-11-11): COD GEN, laboratorio, presentación y POS / NO POS de un COD GEN en «ASIGNAR». El producto sigue su curso; la
+ * creación (archivos de cargue) espera la aprobación (A09). Si el Administrador lo rechazó y los datos no cambiaron, no se vuelve a enviar.
+ * Devuelve los errores por producto: [lote_item_id => [regla => mensaje]].
+ */
+function _sol_aplicar_propuestas(PDO $pdo, array $items, int $usuarioId): array {
+    $err = [];
+    $fila = function (string $sql, array $p) use ($pdo) { $st = $pdo->prepare($sql); $st->execute($p); return $st->fetch() ?: null; };
+    foreach ($items as $i) {
+        $id = (int) $i['id'];
+        $prop = json_decode((string) $i['datos_propuestos'], true) ?: [];
+        $e = _u($i['codigo_generico_audifarma']);
+        // COD GEN nuevo (o rechazado con datos corregidos)
+        if ($e !== '' && is_array($prop['molecula'] ?? null)) {
+            $m = $fila('SELECT * FROM cat_molecula WHERE UPPER(cod_gen_audifarma) = ?', [$e]);
+            $datos = $prop['molecula'] + ['cod_gen_audifarma' => $e];
+            $u = _sol_ultima($pdo, 'MOLECULA', $e);
+            if ((!$m || $m['aprobacion'] === 'RECHAZADO') && !($m && $u && $u['estado'] === 'RECHAZADA' && _sol_mismos($u['datos'], $datos))) {
+                try {
+                    $r = molecula_guardar($pdo, ['activo' => 1] + $datos + ($m ? ['id' => $m['id'], 'codigo_medicar' => $m['codigo_medicar']] : []), $usuarioId);
+                    $pdo->prepare("UPDATE cat_molecula SET aprobacion = 'PENDIENTE', activo = 1 WHERE id = ?")->execute([$r['registro']['id']]);
+                    _sol_pedir($pdo, $id, 'MOLECULA', $e, $datos + ['codigo_medicar' => $r['registro']['codigo_medicar']], $usuarioId);
+                } catch (ErrorApi $x) { $err[$id]['E03'] = $x->getMessage(); }
+            }
+        }
+        // POS / NO POS de un COD GEN en «ASIGNAR»: se asigna de una vez; si el Administrador lo rechaza, vuelve a ASIGNAR
+        if ($e !== '' && in_array($prop['asignar_pos'] ?? '', ['POS', 'NO POS'], true)) {
+            $m = $fila('SELECT * FROM cat_molecula WHERE UPPER(cod_gen_audifarma) = ?', [$e]);
+            $datos = ['cod_gen_audifarma' => $e, 'pos_no_pos' => $prop['asignar_pos']];
+            $u = _sol_ultima($pdo, 'ASIGNAR_POS', $e);
+            if ($m && _u($m['pos_no_pos']) === 'ASIGNAR' && !($u && $u['estado'] === 'RECHAZADA' && _sol_mismos($u['datos'], $datos))) {
+                $pdo->prepare('UPDATE cat_molecula SET pos_no_pos = ?, actualizado_en = ? WHERE id = ?')->execute([$prop['asignar_pos'], ahora(), $m['id']]);
+                auditar($usuarioId, 'MOLECULA_EDITAR', 'cat_molecula', (int) $m['id'], ['pos_no_pos' => $m['pos_no_pos']], ['pos_no_pos' => $prop['asignar_pos'], 'pendiente_aprobacion' => true]);
+                _sol_pedir($pdo, $id, 'ASIGNAR_POS', $e, $datos, $usuarioId);
+            }
+        }
+        // laboratorio nuevo
+        $lab = _u((string) $i['laboratorio']);
+        if ($lab !== '' && !laboratorio_activo_por_nombre($pdo, $lab) && !$fila('SELECT id FROM cat_laboratorio WHERE UPPER(TRIM(nombre)) = ?', [$lab])) {
+            try {
+                $r = laboratorio_guardar($pdo, ['nombre' => $lab, 'activo' => 1], $usuarioId);
+                $pdo->prepare("UPDATE cat_laboratorio SET aprobacion = 'PENDIENTE' WHERE id = ?")->execute([$r['id']]);
+                _sol_pedir($pdo, $id, 'LABORATORIO', $lab, ['nombre' => $lab, 'codigo' => $r['codigo']], $usuarioId);
+            } catch (ErrorApi $x) { $err[$id]['E04'] = $x->getMessage(); }
+        }
+        // presentación nueva (o rechazada con otra unidad de orden)
+        $presTxt = $i['presentacion_1'] !== null && $i['unidad_presentacion'] !== null ? _u($i['presentacion_1']) . ' X ' . (int) $i['unidad_presentacion'] : null;
+        if ($presTxt !== null && is_array($prop['presentacion'] ?? null)) {
+            $p = $fila('SELECT * FROM cat_presentacion WHERE UPPER(presentacion_agrupada) = ?', [$presTxt]);
+            $datos = ['presentacion_agrupada' => $presTxt, 'envase' => _u($i['presentacion_1']), 'cantidad' => (int) $i['unidad_presentacion'], 'unidad_orden' => _u($prop['presentacion']['unidad_orden'] ?? '')];
+            $u = _sol_ultima($pdo, 'PRESENTACION', $presTxt);
+            if ((!$p || $p['aprobacion'] === 'RECHAZADO') && !($p && $u && $u['estado'] === 'RECHAZADA' && _sol_mismos($u['datos'], $datos))) {
+                try {
+                    $r = presentacion_guardar($pdo, $datos + ['activo' => 1] + ($p ? ['id' => $p['id']] : []), $usuarioId);
+                    $pdo->prepare("UPDATE cat_presentacion SET aprobacion = 'PENDIENTE', activo = 1 WHERE id = ?")->execute([$r['registro']['id']]);
+                    _sol_pedir($pdo, $id, 'PRESENTACION', $presTxt, $datos + ['codigo' => $r['registro']['codigo']], $usuarioId);
+                } catch (ErrorApi $x) { $err[$id]['E05'] = $x->getMessage(); }
+            }
+        }
+    }
+    return $err;
+}
+
 /** Crea o edita un producto de la solicitud (solo en BORRADOR o VALIDADA). Queda sin validar hasta «Validar». */
 function sol_item_guardar(PDO $pdo, int $loteId, array $d, int $usuarioId): int {
     $lote = _sol_lote($pdo, $loteId);
@@ -114,6 +225,7 @@ function sol_item_guardar(PDO $pdo, int $loteId, array $d, int $usuarioId): int 
         'asignar_pos'  => in_array($d['asignar_pos'] ?? '', ['POS', 'NO POS'], true) ? $d['asignar_pos'] : null,
         'presentacion' => is_array($d['presentacion_nueva'] ?? null) ? $d['presentacion_nueva'] : null,
         'fecha_no_aplica' => $fechaNoAplica ?: null,
+        'nt'           => _sol_nt_propuesta($d['nt_propuesta'] ?? null), // precio de las líneas nuevas de la MT (2026-11-11)
     ]);
     $datos += ['datos_propuestos' => $propuesta ? json_encode($propuesta, JSON_UNESCAPED_UNICODE) : null,
                'resultado' => 'SIN VALIDAR', 'actualizado_en' => ahora()];
@@ -138,12 +250,44 @@ function sol_item_guardar(PDO $pdo, int $loteId, array $d, int $usuarioId): int 
 function sol_item_eliminar(PDO $pdo, int $loteId, int $itemId, int $usuarioId): void {
     $lote = _sol_lote($pdo, $loteId);
     if (!in_array($lote['estado'], ['BORRADOR', 'VALIDADA'], true)) throw new ErrorApi('La solicitud ya no se puede modificar.', 409);
-    $pdo->prepare('DELETE FROM proc_resultado WHERE lote_item_id = ?')->execute([$itemId]);
-    $pdo->prepare("UPDATE proc_aprobacion SET estado = 'ANULADA' WHERE lote_item_id = ? AND estado = 'PENDIENTE'")->execute([$itemId]);
-    $st = $pdo->prepare('DELETE FROM proc_lote_item WHERE id = ? AND lote_id = ?');
+    $st = $pdo->prepare('SELECT * FROM proc_lote_item WHERE id = ? AND lote_id = ?');
     $st->execute([$itemId, $loteId]);
-    if (!$st->rowCount()) throw new ErrorApi('Producto no encontrado en la solicitud.', 404);
-    auditar($usuarioId, 'SOLICITUD_ITEM_ELIMINAR', 'proc_lote_item', $itemId, null, null);
+    $item = $st->fetch();
+    if (!$item) throw new ErrorApi('Producto no encontrado en la solicitud.', 404);
+    // (2026-11-11) antes fallaba: las aprobaciones del producto lo referencian (llave foránea) y no dejaban borrarlo.
+    // Lo pendiente que creó este producto en el catálogo (COD GEN, laboratorio, presentación, POS) se deshace, salvo que otro
+    // producto por crear lo siga usando: en ese caso la aprobación pasa a ese producto.
+    $otro = function (string $tipo, string $clave) use ($pdo, $itemId): ?int {
+        $col = ['MOLECULA' => 'UPPER(i.codigo_generico_audifarma)', 'ASIGNAR_POS' => 'UPPER(i.codigo_generico_audifarma)', 'LABORATORIO' => 'UPPER(TRIM(i.laboratorio))',
+                'PRESENTACION' => "UPPER(i.presentacion_1) || ' X ' || i.unidad_presentacion"][$tipo] ?? null;
+        if ($col === null) return null;
+        if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql') $col = str_replace("UPPER(i.presentacion_1) || ' X ' || i.unidad_presentacion", "CONCAT(UPPER(i.presentacion_1), ' X ', i.unidad_presentacion)", $col);
+        $st = $pdo->prepare("SELECT i.id FROM proc_lote_item i JOIN proc_lote l ON l.id = i.lote_id WHERE l.estado IN ('BORRADOR', 'VALIDADA') AND i.id <> ? AND $col = ? ORDER BY i.id LIMIT 1");
+        $st->execute([$itemId, $clave]);
+        return ($v = $st->fetchColumn()) ? (int) $v : null;
+    };
+    $deshechos = [];
+    $st = $pdo->prepare("SELECT * FROM proc_aprobacion WHERE lote_item_id = ? AND estado = 'PENDIENTE'");
+    $st->execute([$itemId]);
+    foreach ($st->fetchAll() as $a) {
+        if ($a['tipo'] !== 'INCLUIR_NT' && ($o = $otro($a['tipo'], _u($a['clave'])))) {
+            $pdo->prepare('UPDATE proc_aprobacion SET lote_item_id = ? WHERE id = ?')->execute([$o, $a['id']]);
+            continue;
+        }
+        $clave = _u($a['clave']);
+        if ($a['tipo'] === 'MOLECULA') $pdo->prepare("DELETE FROM cat_molecula WHERE UPPER(cod_gen_audifarma) = ? AND aprobacion = 'PENDIENTE'")->execute([$clave]);
+        if ($a['tipo'] === 'LABORATORIO') $pdo->prepare("DELETE FROM cat_laboratorio WHERE UPPER(TRIM(nombre)) = ? AND aprobacion = 'PENDIENTE'")->execute([$clave]);
+        if ($a['tipo'] === 'PRESENTACION') $pdo->prepare("DELETE FROM cat_presentacion WHERE UPPER(presentacion_agrupada) = ? AND aprobacion = 'PENDIENTE'")->execute([$clave]);
+        if ($a['tipo'] === 'ASIGNAR_POS') $pdo->prepare("UPDATE cat_molecula SET pos_no_pos = 'ASIGNAR', actualizado_en = ? WHERE UPPER(cod_gen_audifarma) = ?")->execute([ahora(), $clave]);
+        $deshechos[] = "{$a['tipo']} {$a['clave']}";
+        $pdo->prepare('DELETE FROM proc_aprobacion WHERE id = ?')->execute([$a['id']]);
+    }
+    // las ya resueltas (aprobadas o rechazadas) quedan en la auditoría; se borran para poder quitar el producto
+    $pdo->prepare('DELETE FROM proc_aprobacion WHERE lote_item_id = ?')->execute([$itemId]);
+    $pdo->prepare('DELETE FROM proc_resultado WHERE lote_item_id = ?')->execute([$itemId]);
+    $pdo->prepare('DELETE FROM proc_lote_item WHERE id = ?')->execute([$itemId]);
+    auditar($usuarioId, 'SOLICITUD_ITEM_ELIMINAR', 'proc_lote_item', $itemId,
+        ['cod_auf' => $item['codigo_generico_audifarma'], 'cum' => $item['cum'], 'laboratorio' => $item['laboratorio']], ['deshecho_en_catalogo' => $deshechos]);
 }
 
 /** La solicitud con sus productos, resultados y aprobaciones. */
@@ -248,6 +392,7 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
     $st->execute([$loteId]);
     $items = $st->fetchAll();
     if (!$items) throw new ErrorApi('La solicitud no tiene productos.', 422);
+    $errProp = _sol_aplicar_propuestas($pdo, $items, $usuarioId); // lo nuevo se crea pendiente de aprobación (2026-11-11)
     $cums = array_values(array_unique(array_filter(array_map(fn($i) => _u($i['cum']), $items))));
     $enCums = $cums ? implode(',', array_fill(0, count($cums), '?')) : "''";
     $q = function (string $sql, array $p = []) use ($pdo) { $st = $pdo->prepare($sql); $st->execute($p); return $st; };
@@ -256,10 +401,12 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
     $molecula = [];
     foreach ($pdo->query('SELECT * FROM cat_molecula') as $m) $molecula[_u($m['cod_gen_audifarma'])] = $m;
     $presentacion = [];
-    foreach ($pdo->query('SELECT presentacion_agrupada, codigo, unidad_orden, activo FROM cat_presentacion') as $p) $presentacion[_u($p['presentacion_agrupada'])] = $p;
+    // lo rechazado por el Administrador no se usa (el producto queda en error con el motivo)
+    foreach ($pdo->query('SELECT presentacion_agrupada, codigo, unidad_orden, activo, aprobacion FROM cat_presentacion') as $p) if ($p['aprobacion'] !== 'RECHAZADO') $presentacion[_u($p['presentacion_agrupada'])] = $p;
     $laboratorio = [];
     $labClave = []; // laboratorios activos por clave (sin puntos ni espacios): el repetido inactivado se resuelve al que quedó
-    foreach ($pdo->query('SELECT nombre, codigo, activo FROM cat_laboratorio') as $l) {
+    foreach ($pdo->query('SELECT nombre, codigo, activo, aprobacion FROM cat_laboratorio') as $l) {
+        if ($l['aprobacion'] === 'RECHAZADO') continue;
         $laboratorio[_u($l['nombre'])] = $l;
         if ((int) $l['activo']) $labClave[laboratorio_clave($l['nombre'])] = $l;
     }
@@ -292,11 +439,19 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
     $inactivas = reglas_inactivas($pdo);                    // una regla inactiva no se aplica
     $personalizadas = reglas_personalizadas($pdo, 'PRODUCTO'); // reglas creadas por el Administrador
 
+    // aprobaciones pendientes (A09) y motivo del último rechazo por tipo + clave
+    $pendientes = [];
+    foreach ($pdo->query("SELECT tipo, clave FROM proc_aprobacion WHERE estado = 'PENDIENTE'") as $r) $pendientes[$r['tipo'] . '|' . $r['clave']] = true;
+    $rechazo = function (string $tipo, string $clave) use ($pdo): ?string {
+        $u = _sol_ultima($pdo, $tipo, $clave);
+        return $u && $u['estado'] === 'RECHAZADA' ? ($u['motivo'] ?: 'sin motivo') : null;
+    };
     $porCodigo = [];
     $calc = [];
     foreach ($items as $i) {
         $e = _u($i['codigo_generico_audifarma']);
         $m = $molecula[$e] ?? null;
+        if ($m && $m['aprobacion'] === 'RECHAZADO') $m = null; // rechazado por el Administrador
         $presTxt = $i['presentacion_1'] !== null && $i['unidad_presentacion'] !== null ? _u($i['presentacion_1']) . ' X ' . $i['unidad_presentacion'] : null;
         $p = $presTxt !== null ? ($presentacion[$presTxt] ?? null) : null;
         $l = $i['laboratorio'] !== null ? ($labClave[laboratorio_clave($i['laboratorio'])] ?? $laboratorio[_u($i['laboratorio'])] ?? null) : null;
@@ -329,25 +484,29 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
         foreach ($faltan as $k) $add('E01', 'ERROR', SOL_CAMPOS[$k][0], '(vacío)', 'Diligenciado');
 
         // E03 / E17 COD GEN
+        // (2026-11-11) lo nuevo ya se creó al validar, pendiente de aprobación (A09); aquí solo queda el error si falta o si se rechazó
         if ($e !== '' && !$m) {
-            $add('E03', 'ERROR', 'CODIGO GENERICO AUDIFARMA', $e, 'Existir en COD GEN', isset($propuesta['molecula'])
-                ? 'Pendiente de aprobación del Administrador (crear en COD GEN)' : 'Diligencie los datos de la molécula para enviarla a aprobación');
-            if (isset($propuesta['molecula'])) $aprobaciones[] = ['MOLECULA', $e, $propuesta['molecula'] + ['cod_gen_audifarma' => $e]];
+            $rx = $rechazo('MOLECULA', $e);
+            $add('E03', 'ERROR', 'CODIGO GENERICO AUDIFARMA', $e, 'Existir en COD GEN', $rx !== null
+                ? "Rechazado por el Administrador: $rx. Corrija los datos de la molécula y valide de nuevo"
+                : ($errProp[(int) $i['id']]['E03'] ?? 'Diligencie los datos de la molécula: se crea al validar y la aprueba el Administrador'));
         } elseif ($m && _u($m['pos_no_pos']) === 'ASIGNAR') {
-            $add('E17', 'ERROR', 'CATEGORIA PBS (COD GEN)', 'ASIGNAR', 'POS o NO POS', isset($propuesta['asignar_pos'])
-                ? "Pendiente de aprobación del Administrador ({$propuesta['asignar_pos']})" : 'Elija POS o NO POS para enviarlo a aprobación');
-            if (isset($propuesta['asignar_pos'])) $aprobaciones[] = ['ASIGNAR_POS', $e, ['cod_gen_audifarma' => $e, 'pos_no_pos' => $propuesta['asignar_pos']]];
+            $rx = $rechazo('ASIGNAR_POS', $e);
+            $add('E17', 'ERROR', 'CATEGORIA PBS (COD GEN)', 'ASIGNAR', 'POS o NO POS', $rx !== null
+                ? "Rechazado por el Administrador: $rx. Elija otra vez POS o NO POS y valide" : 'Elija POS o NO POS: se asigna al validar y lo aprueba el Administrador');
         }
         // E04 laboratorio / E05 presentación (se diligencian y aprueba el Administrador, como la molécula)
         if ($i['laboratorio'] !== null && !$l) {
-            $add('E04', 'ERROR', 'LABORATORIO', $i['laboratorio'], 'Existir en Laboratorios', 'Pendiente de aprobación del Administrador (crear el laboratorio)');
-            $aprobaciones[] = ['LABORATORIO', _u($i['laboratorio']), ['nombre' => _u($i['laboratorio'])]];
+            $rx = $rechazo('LABORATORIO', _u($i['laboratorio']));
+            $add('E04', 'ERROR', 'LABORATORIO', $i['laboratorio'], 'Existir en Laboratorios', $rx !== null
+                ? "Rechazado por el Administrador: $rx. Elija un laboratorio del catálogo o corrija el nombre"
+                : ($errProp[(int) $i['id']]['E04'] ?? 'No se pudo crear el laboratorio: revise el nombre'));
         }
         if ($presTxt !== null && !$p) {
-            $add('E05', 'ERROR', 'PRESENTACION', $presTxt, 'Existir en Presentaciones', isset($propuesta['presentacion'])
-                ? 'Pendiente de aprobación del Administrador (crear la presentación)' : 'Diligencie la unidad de orden para enviarla a aprobación');
-            if (isset($propuesta['presentacion'])) $aprobaciones[] = ['PRESENTACION', $presTxt, $propuesta['presentacion'] + ['presentacion_agrupada' => $presTxt,
-                'envase' => _u($i['presentacion_1']), 'cantidad' => (int) $i['unidad_presentacion']]];
+            $rx = $rechazo('PRESENTACION', $presTxt);
+            $add('E05', 'ERROR', 'PRESENTACION', $presTxt, 'Existir en Presentaciones', $rx !== null
+                ? "Rechazado por el Administrador: $rx. Corrija la unidad de orden y valide de nuevo"
+                : ($errProp[(int) $i['id']]['E05'] ?? 'Diligencie la unidad de orden: la presentación se crea al validar y la aprueba el Administrador'));
         }
         // Molécula ya en Medicar: el producto SÍ se crea; lo que no se vuelve a crear es la molécula (COD GEN) en el
         // formato 1 de Medicar (fase 6). No se muestra como alerta (decisión del usuario, 2026-10-03).
@@ -362,7 +521,17 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
         $inv = $c !== '' ? ($invima[$c] ?? null) : null;
         $regVigente = $especialReg || $especialCum || $insumoPropio || ($inv && _registro_vigente($inv['estado_registro']));
         if (!$especialCum && !$especialReg && !$insumoPropio && $c !== '') {
-            if (!$inv) $add('E09', 'ERROR', 'CUM', $c, 'Existir en INVIMA', 'Verificar el CUM en INVIMA');
+            if (!$inv) {
+                // CUM que no está en INVIMA: vale el registro y su estado completados en la Maestra Tarifaria (la MT manda, 2026-11-11)
+                $mtReg = null;
+                foreach (NT_CONTRATOS as $kk) {
+                    $x = $nt["$c|$kk"] ?? null;
+                    if ($x && trim((string) ($x['registro_mt'] ?? '')) !== '' && trim((string) ($x['estado_registro_mt'] ?? '')) !== '') { $mtReg = $x; break; }
+                }
+                if (!$mtReg) $add('E09', 'ERROR', 'CUM', $c, 'Existir en INVIMA', 'Verificar el CUM en INVIMA o completar su registro sanitario y estado en la Maestra Tarifaria');
+                elseif (!_registro_vigente($mtReg['estado_registro_mt'])) $add('E09', 'ERROR', 'REGISTRO SANITARIO', "Registro {$mtReg['registro_mt']} {$mtReg['estado_registro_mt']} (Maestra Tarifaria)",
+                    'Registro vigente', 'No se puede crear: el registro no está vigente');
+            }
             elseif (!$regVigente) $add('E09', 'ERROR', 'REGISTRO SANITARIO', "CUM {$inv['estado_cum']} · registro {$inv['registro_sanitario']} {$inv['estado_registro']}",
                 'Registro vigente', 'No se puede crear: el registro INVIMA no está vigente');
             if ($inv) {
@@ -389,10 +558,12 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
         if (isset($sasCum[$c]) || isset($sasCod[$e])) $asignados['EVENTO SAS SIN AUTORIZACION'] = 'EVENTO SAS';
         // EVENTO: se asigna si está en el contrato. Si no está en ninguna otra lista, el subplán EVENTO se muestra igual
         // (es el que le corresponde) y E10 lo deja en error hasta que lo incluyan en el contrato (no se crea).
-        if ($lineaEvento && ($lineaEvento['en_contrato'] === 'SI' || !$asignados)) $asignados[$m && _u($m['pos_no_pos']) === 'NO POS' ? 'EVENTO NO PBS' : 'EVENTO POS'] = 'EVENTO';
-        $sug = $lineaEvento === null && $c !== '' && $e !== '' ? nt_sugerencia($pdo, $e, $c) : null; // ID MUTUAL: CUM → Maestra Mutual → Maestra Tarifaria por COD AUF
-        $incluirNt = fn(string $k) => $c !== '' && $e !== '' ? ['INCLUIR_NT', "$c|$k", array_filter(['cum_facturar' => $c, 'cod_auf' => $e, 'contrato' => $k,
-            'descripcion' => $m['descripcion_general'] ?? null, 'cum' => $c, 'cod_mutual' => $sug['cod_mutual'] ?? null], fn($v) => $v !== null)] : null;
+        // ID MUTUAL: CUM → Maestra Mutual → Maestra Tarifaria por COD AUF; también dice en qué contratos está el producto (2026-11-11).
+        // Con el ID MUTUAL que propuso el usuario de creación, si lo digitó.
+        $propNt = $propuesta['nt'] ?? null;
+        $sug = $c !== '' && $e !== '' ? nt_sugerencia($pdo, $e, $c, (string) ($propNt['cod_mutual'] ?? '')) : null;
+        $enCtrEvento = $lineaEvento ? $lineaEvento['en_contrato'] === 'SI' : !empty($sug['contrato_evento']);
+        if ($enCtrEvento || ($lineaEvento && !$asignados)) $asignados[$m && _u($m['pos_no_pos']) === 'NO POS' ? 'EVENTO NO PBS' : 'EVENTO POS'] = 'EVENTO';
         // en ninguna lista y sin línea EVENTO en la Maestra Tarifaria: se muestra el subplán EVENTO que le corresponde; abajo, E10 y la
         // solicitud al Administrador para incluirlo en la Maestra Tarifaria (no se crea hasta tener la línea)
         if (!$asignados && $c !== '') $asignados[$m && _u($m['pos_no_pos']) === 'NO POS' ? 'EVENTO NO PBS' : 'EVENTO POS'] = 'EVENTO';
@@ -402,15 +573,39 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
         foreach ($asignados as $sp => $k) {
             $ln = $nt["$c|$k"] ?? null;
             if (!$ln) {
-                $add('E10', 'ERROR', 'CUM', "$c (línea $k)", 'Estar en la Maestra Tarifaria', 'Solicitud al Administrador para incluirlo en la Maestra Tarifaria');
-                if ($a = $incluirNt($k)) $aprobaciones[] = $a;
+                // Flujo (pedido del usuario, 2026-11-11): 1) el producto debe estar en el contrato; 2) el Administrador lo incluye en la Maestra
+                // Tarifaria; 3) se crea en SIESA y MEDICAR. Si aún no está en el contrato, no se pide incluirlo en la MT (E11).
+                $fuera = $sug ? nt_fuera_de_contrato($sug, $k) : 'falta el COD AUF o el CUM';
+                if ($fuera) {
+                    $add('E11', 'ERROR', 'CONTRATO', "$c (línea $k)", 'Estar en el contrato', "PTE POR INCLUIR EN EL CONTRATO ($fuera). Cuando esté en el contrato, se pide incluirlo en la Maestra Tarifaria");
+                    continue;
+                }
+                // el precio lo propone el usuario de creación (calculadora de precio de venta); el Administrador solo aprueba o rechaza
+                $pl = $propNt['lineas'][$k] ?? null;
+                if (!$pl || $pl['precio_venta'] === null) {
+                    $add('E10', 'ERROR', "PRECIO ($k)", '(vacío)', 'Precio de venta propuesto', "Ya está en el contrato: digite el precio de venta de la línea $k en «Precio para la Maestra Tarifaria» para pedir su inclusión");
+                    continue;
+                }
+                $ctrRef = $sug['contrato_evento'] ?? [];
+                $datosNt = ['cum_facturar' => $c, 'cod_auf' => $e, 'contrato' => $k, 'descripcion' => $m['descripcion_general'] ?? null, 'cum' => $c,
+                    'cod_mutual' => $propNt['cod_mutual'] ?: ($sug['cod_mutual'] ?? null), 'iva' => _u($i['iva']) === 'CON IVA' ? 0.19 : 0,
+                    'precio_venta' => $pl['precio_venta'], 'calculo' => array_intersect_key($pl, array_flip(['origen', 'regla', 'precio_compra', 'porcentaje'])),
+                    'referencia' => ['precio_contrato' => $k === 'CAPITA' ? null : (($ctrRef[$i['tipo_medicamento'] === 'MEDICAMENTOS' ? '714' : '799'] ?? reset($ctrRef) ?: null)['valor'] ?? null),
+                        'tarifa_capita' => $k === 'CAPITA' ? ($sug['tarifa_capita'] ?? null) : null, 'precio_regulado' => $sug['regulado'] ?? null]];
+                $rx = $rechazo('INCLUIR_NT', "$c|$k");
+                $ult = _sol_ultima($pdo, 'INCLUIR_NT', "$c|$k");
+                if ($rx !== null && _sol_mismos($ult['datos'], array_diff_key($datosNt, ['referencia' => 1]))) {
+                    $add('E10', 'ERROR', "PRECIO ($k)", $pl['precio_venta'], null, "Rechazado por el Administrador: $rx. Corrija el precio o el ID MUTUAL y valide de nuevo");
+                    continue;
+                }
+                $aprobaciones[] = ['INCLUIR_NT', "$c|$k", $datosNt];
                 continue;
             }
             $pv = $ln['precio_venta'] !== null ? (float) $ln['precio_venta'] : null;
             $lineas[$sp] = ['contrato' => $k, 'cod_mutual' => $ln['cod_mutual'], 'precio' => $pv,
                 'precio_m' => $ln['precio_maximo'] !== null ? (float) $ln['precio_maximo'] : null];
-            if ($ln['en_contrato'] !== 'SI') $add('E10', 'ERROR', 'ID MUTUAL', "{$ln['cod_mutual']} ($k)", 'Estar en el contrato', 'PTE POR INCLUIR EN EL CONTRATO');
-            // E12: otros errores de la línea (el «no está en el contrato» ya lo informa E10; NT25 «no está en el
+            if ($ln['en_contrato'] !== 'SI') $add('E11', 'ERROR', 'ID MUTUAL', "{$ln['cod_mutual']} ($k)", 'Estar en el contrato', 'PTE POR INCLUIR EN EL CONTRATO');
+            // E12: otros errores de la línea (el «no está en el contrato» ya lo informa E11; NT25 «no está en el
             // Maestro SIESA», NT26 «no está en MEDICAR» y NT30 «sin PLU en SIESA ni en MEDICAR» son justamente lo que se va a crear:
             // NT30 queda como alerta, no bloquea la creación — decisión del usuario, 2026-11-03)
             $erroresNt = array_values(array_filter($ln['motivos'], fn($x) => $x['nivel'] === 'ERROR' && !in_array($x['codigo'], ['NT01', 'NT25', 'NT26', 'NT30'], true)));
@@ -434,6 +629,17 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
         if (!$linea && !empty($sug['cod_mutual'])) $linea = ['contrato' => null, 'cod_mutual' => $sug['cod_mutual'], 'precio' => null, 'precio_m' => null];
         $contratoNt = $linea['contrato'] ?? null;
         $precio = $linea['precio'] ?? null;
+        // A09 (2026-11-11): lo nuevo creado por el usuario de creación espera la aprobación del Administrador; la creación (archivos) espera
+        $etq = ['MOLECULA' => 'COD GEN', 'ASIGNAR_POS' => 'POS / NO POS', 'LABORATORIO' => 'LABORATORIO', 'PRESENTACION' => 'PRESENTACION', 'INCLUIR_NT' => 'MAESTRA TARIFARIA'];
+        $espera = [['MOLECULA', $e], ['ASIGNAR_POS', $e], ['LABORATORIO', _u((string) $i['laboratorio'])], ['PRESENTACION', (string) $presTxt]];
+        foreach ($asignados as $k) $espera[] = ['INCLUIR_NT', "$c|$k"];
+        foreach ($aprobaciones as [$t, $cl]) $espera[] = [$t, $cl];
+        $vistos = [];
+        foreach ($espera as [$t, $cl]) {
+            if ($cl === '' || isset($vistos["$t|$cl"]) || !(isset($pendientes["$t|$cl"]) || in_array([$t, $cl], array_map(fn($x) => [$x[0], $x[1]], $aprobaciones), true))) continue;
+            $vistos["$t|$cl"] = true;
+            $add('A09', 'ALERTA', $etq[$t] ?? $t, $cl, null, 'Pendiente de aprobación del Administrador: el producto se crea cuando la apruebe');
+        }
         // E16 RIPS
         foreach (['forma_farmaceutica_rips' => 'FFM', 'concentracion_rips' => 'UMM', 'unidad_medida_rips' => 'UPR'] as $k => $t) {
             if ($i[$k] !== null && empty($rips[$t][_u($i[$k])])) $add('E16', 'ERROR', SOL_CAMPOS[$k][0], $i[$k], "Código habilitado en la tabla RIPS $t");
@@ -461,11 +667,7 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
                        datos_calculados = ?, actualizado_en = ? WHERE id = ?')
             ->execute([$codigo, implode(' + ', $subplanes), $m['pos_no_pos'] ?? null, 'CREACION', $estado, json_encode($calculado, JSON_UNESCAPED_UNICODE), ahora(), $id]);
         // aprobaciones pendientes (una por tipo + clave: si otro producto ya la pidió, no se repite)
-        foreach ($aprobaciones as [$tipo, $clave, $datos]) {
-            $ex = $q("SELECT id FROM proc_aprobacion WHERE tipo = ? AND clave = ? AND estado = 'PENDIENTE'", [$tipo, $clave])->fetchColumn();
-            if (!$ex) insertar($pdo, 'proc_aprobacion', ['lote_item_id' => $id, 'tipo' => $tipo, 'clave' => $clave, 'datos' => json_encode($datos, JSON_UNESCAPED_UNICODE),
-                'estado' => 'PENDIENTE', 'solicitado_por' => $usuarioId, 'solicitado_en' => ahora()]);
-        }
+        foreach ($aprobaciones as [$tipo, $clave, $datos]) _sol_pedir($pdo, $id, $tipo, $clave, $datos, $usuarioId);
     }
     $pdo->prepare("UPDATE proc_lote SET estado = 'VALIDADA', validado_en = ? WHERE id = ?")->execute([ahora(), $loteId]);
     auditar($usuarioId, 'SOLICITUD_VALIDAR', 'proc_lote', $loteId, null, $resumen);
@@ -484,9 +686,50 @@ function bases_estado_resumen(PDO $pdo): array {
 }
 
 // ------------------------------------------------------------------------------------------- aprobaciones
+/**
+ * El usuario de creación crea (o corrige y reenvía) un COD GEN en el catálogo (pedido del usuario, 2026-11-17): queda «Pendiente de
+ * aprobación» y le llega al Administrador en Aprobaciones, igual que desde Crear productos. Los productos que lo usan esperan (A09).
+ * Solo puede tocar los que están pendientes o rechazados; los aprobados los edita el Administrador.
+ */
+function molecula_proponer(PDO $pdo, array $in, int $usuarioId): array {
+    $id = (int) ($in['id'] ?? 0);
+    if ($id) {
+        $st = $pdo->prepare('SELECT * FROM cat_molecula WHERE id = ?');
+        $st->execute([$id]);
+        $antes = $st->fetch();
+        if (!$antes) throw new ErrorApi('El COD GEN no existe.', 404);
+        if (!in_array($antes['aprobacion'], ['PENDIENTE', 'RECHAZADO'], true)) throw new ErrorApi('Este COD GEN ya está aprobado: solo el Administrador lo edita.', 403);
+        $in['codigo_medicar'] = $antes['codigo_medicar']; // el código Medicar lo asigna el aplicativo
+    } else {
+        unset($in['codigo_medicar']); // siguiente consecutivo libre
+    }
+    $in['activo'] = 1;
+    $m = molecula_guardar($pdo, $in, $usuarioId)['registro'];
+    $pdo->prepare("UPDATE cat_molecula SET aprobacion = 'PENDIENTE', activo = 1 WHERE id = ?")->execute([$m['id']]);
+    $cod = _u($m['cod_gen_audifarma']);
+    $datos = array_intersect_key($m, array_flip(['cod_gen_audifarma', 'descripcion_general', 'codigo_medicar', 'concentracion_agrupada', 'principio_activo',
+        'forma_farmaceutica', 'via_administracion', 'grupo_farmacologico', 'pos_no_pos', 'cadena_frio', 'clasificacion_entrega', 'cantidad_tope']));
+    _sol_pedir($pdo, null, 'MOLECULA', $cod, $datos, $usuarioId);
+    // los productos por crear que usan este COD GEN muestran la espera (A09) o dejan de mostrar el rechazo
+    $st = $pdo->prepare("SELECT DISTINCT i.lote_id FROM proc_lote_item i JOIN proc_lote l ON l.id = i.lote_id WHERE l.estado IN ('BORRADOR', 'VALIDADA') AND UPPER(i.codigo_generico_audifarma) = ?");
+    $st->execute([$cod]);
+    foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $l) sol_validar($pdo, (int) $l, $usuarioId);
+    return ['registro' => $m + ['aprobacion' => 'PENDIENTE'], 'aviso' => null];
+}
+
+/** Motivo del último rechazo de cada COD GEN rechazado (para que el usuario de creación corrija). */
+function molecula_rechazos(PDO $pdo): array {
+    $out = [];
+    foreach ($pdo->query("SELECT cod_gen_audifarma FROM cat_molecula WHERE aprobacion = 'RECHAZADO'")->fetchAll(PDO::FETCH_COLUMN) as $c) {
+        $u = _sol_ultima($pdo, 'MOLECULA', _u($c));
+        if ($u && $u['estado'] === 'RECHAZADA') $out[$c] = $u['motivo'] ?: 'sin motivo';
+    }
+    return $out;
+}
+
 function sol_aprobaciones(PDO $pdo, string $estado = 'PENDIENTE'): array {
     $st = $pdo->prepare("SELECT a.*, i.lote_id, i.fila, i.cum, i.codigo_generico_audifarma, i.nombre_comercial, u.nombre AS solicitado_por_nombre, r.nombre AS resuelto_por_nombre
-                           FROM proc_aprobacion a JOIN proc_lote_item i ON i.id = a.lote_item_id
+                           FROM proc_aprobacion a LEFT JOIN proc_lote_item i ON i.id = a.lote_item_id
                            LEFT JOIN seg_usuario u ON u.id = a.solicitado_por LEFT JOIN seg_usuario r ON r.id = a.resuelto_por
                           WHERE a.estado = ? ORDER BY a.id DESC LIMIT 500");
     $st->execute([$estado]);
@@ -500,38 +743,54 @@ function sol_aprobaciones(PDO $pdo, string $estado = 'PENDIENTE'): array {
  * $ajustes: los datos revisados por el Administrador (reemplazan los propuestos). Luego se revalida la solicitud.
  */
 function sol_resolver(PDO $pdo, int $aprobacionId, bool $aprobar, array $ajustes, string $motivo, int $usuarioId): array {
-    $st = $pdo->prepare("SELECT a.*, i.lote_id FROM proc_aprobacion a JOIN proc_lote_item i ON i.id = a.lote_item_id WHERE a.id = ?");
+    $st = $pdo->prepare("SELECT a.*, i.lote_id FROM proc_aprobacion a LEFT JOIN proc_lote_item i ON i.id = a.lote_item_id WHERE a.id = ?");
     $st->execute([$aprobacionId]);
     $a = $st->fetch();
     if (!$a || $a['estado'] !== 'PENDIENTE') throw new ErrorApi('La aprobación no está pendiente.', 409);
-    $datos = $ajustes + (json_decode((string) $a['datos'], true) ?: []);
+    // (2026-11-11) el Administrador solo aprueba o rechaza lo que registró el usuario de creación: no digita ni corrige datos
+    $datos = json_decode((string) $a['datos'], true) ?: [];
+    if (!$aprobar && trim($motivo) === '') throw new ErrorApi('Escriba el motivo del rechazo: el usuario de creación lo ve para corregir.', 422);
     $resultado = null;
-    if ($aprobar) {
-        switch ($a['tipo']) {
-            case 'MOLECULA':
-                $resultado = molecula_guardar($pdo, $datos + ['activo' => 1], $usuarioId);
-                break;
-            case 'ASIGNAR_POS':
-                $m = $pdo->prepare('SELECT * FROM cat_molecula WHERE UPPER(cod_gen_audifarma) = ?');
-                $m->execute([_u($datos['cod_gen_audifarma'])]);
-                $mol = $m->fetch();
-                if (!$mol) throw new ErrorApi('El COD GEN ya no existe.', 404);
-                if (!in_array($datos['pos_no_pos'] ?? '', ['POS', 'NO POS'], true)) throw new ErrorApi('Elija POS o NO POS.', 422);
-                $resultado = molecula_guardar($pdo, ['id' => $mol['id'], 'pos_no_pos' => $datos['pos_no_pos']] + $mol, $usuarioId);
-                break;
-            case 'LABORATORIO':
-                $resultado = laboratorio_guardar($pdo, ['nombre' => $datos['nombre'], 'activo' => 1], $usuarioId);
-                break;
-            case 'PRESENTACION':
-                $resultado = presentacion_guardar($pdo, ['envase' => $datos['envase'] ?? '', 'cantidad' => $datos['cantidad'] ?? '', 'unidad_orden' => $datos['unidad_orden'] ?? '', 'activo' => 1], $usuarioId);
-                break;
-            case 'INCLUIR_NT':
-                // el Administrador revisa los datos en el formulario «Nuevo» de la Maestra Tarifaria y con «Incluir» se crean las líneas
-                $resultado = !empty($ajustes['_ya_incluido']) ? ['incluido' => true] : nt_guardar($pdo, $datos + ['id' => 0], $usuarioId);
-                break;
-            default:
-                throw new ErrorApi('Tipo de aprobación desconocido.', 422);
-        }
+    $fila = function (string $sql, array $p) use ($pdo) { $st = $pdo->prepare($sql); $st->execute($p); return $st->fetch() ?: null; };
+    $cod = _u($datos['cod_gen_audifarma'] ?? '');
+    switch ($a['tipo']) {
+        case 'MOLECULA':
+            $m = $fila('SELECT * FROM cat_molecula WHERE UPPER(cod_gen_audifarma) = ?', [$cod]);
+            if ($aprobar) {
+                if ($m) $pdo->prepare('UPDATE cat_molecula SET aprobacion = NULL, activo = 1 WHERE id = ?')->execute([$m['id']]);
+                else $resultado = molecula_guardar($pdo, $datos + ['activo' => 1], $usuarioId); // solicitud anterior al cambio: aún no estaba creado
+            } elseif ($m && $m['aprobacion'] === 'PENDIENTE') $pdo->prepare("UPDATE cat_molecula SET aprobacion = 'RECHAZADO', activo = 0 WHERE id = ?")->execute([$m['id']]);
+            break;
+        case 'ASIGNAR_POS':
+            $m = $fila('SELECT * FROM cat_molecula WHERE UPPER(cod_gen_audifarma) = ?', [$cod]);
+            if (!$m) throw new ErrorApi('El COD GEN ya no existe.', 404);
+            if ($aprobar && _u($m['pos_no_pos']) === 'ASIGNAR') $pdo->prepare('UPDATE cat_molecula SET pos_no_pos = ?, actualizado_en = ? WHERE id = ?')->execute([$datos['pos_no_pos'], ahora(), $m['id']]);
+            if (!$aprobar) $pdo->prepare("UPDATE cat_molecula SET pos_no_pos = 'ASIGNAR', actualizado_en = ? WHERE id = ?")->execute([ahora(), $m['id']]);
+            break;
+        case 'LABORATORIO':
+            $l = $fila('SELECT * FROM cat_laboratorio WHERE UPPER(TRIM(nombre)) = ?', [_u($datos['nombre'] ?? '')]);
+            if ($aprobar) {
+                if ($l) $pdo->prepare('UPDATE cat_laboratorio SET aprobacion = NULL, activo = 1 WHERE id = ?')->execute([$l['id']]);
+                else $resultado = laboratorio_guardar($pdo, ['nombre' => $datos['nombre'], 'activo' => 1], $usuarioId);
+            } elseif ($l && $l['aprobacion'] === 'PENDIENTE') $pdo->prepare("UPDATE cat_laboratorio SET aprobacion = 'RECHAZADO', activo = 0 WHERE id = ?")->execute([$l['id']]);
+            break;
+        case 'PRESENTACION':
+            $p = $fila('SELECT * FROM cat_presentacion WHERE UPPER(presentacion_agrupada) = ?', [_u($datos['presentacion_agrupada'] ?? $a['clave'])]);
+            if ($aprobar) {
+                if ($p) $pdo->prepare('UPDATE cat_presentacion SET aprobacion = NULL, activo = 1 WHERE id = ?')->execute([$p['id']]);
+                else $resultado = presentacion_guardar($pdo, ['envase' => $datos['envase'] ?? '', 'cantidad' => $datos['cantidad'] ?? '', 'unidad_orden' => $datos['unidad_orden'] ?? '', 'activo' => 1], $usuarioId);
+            } elseif ($p && $p['aprobacion'] === 'PENDIENTE') $pdo->prepare("UPDATE cat_presentacion SET aprobacion = 'RECHAZADO', activo = 0 WHERE id = ?")->execute([$p['id']]);
+            break;
+        case 'INCLUIR_NT':
+            if ($aprobar) {
+                if (!isset($datos['precio_venta'])) throw new ErrorApi('Esta solicitud es anterior al cambio y no trae precio: recházela para que el usuario de creación digite el precio y la vuelva a enviar.', 422);
+                $resultado = nt_guardar($pdo, ['id' => 0, 'cod_auf' => $datos['cod_auf'], 'cum_facturar' => $datos['cum_facturar'], 'cum' => $datos['cum'] ?? $datos['cum_facturar'],
+                    'cod_mutual' => $datos['cod_mutual'] ?? '', 'iva' => $datos['iva'] ?? 0,
+                    'lineas' => [['contrato' => $datos['contrato'], 'precio_venta' => $datos['precio_venta'], 'calculo' => $datos['calculo'] ?? null]]], $usuarioId);
+            }
+            break;
+        default:
+            throw new ErrorApi('Tipo de aprobación desconocido.', 422);
     }
     $pdo->prepare('UPDATE proc_aprobacion SET estado = ?, resuelto_por = ?, resuelto_en = ?, motivo = ?, datos = ? WHERE id = ?')
         ->execute([$aprobar ? 'APROBADA' : 'RECHAZADA', $usuarioId, ahora(), mb_substr(trim($motivo), 0, 500) ?: null, json_encode($datos, JSON_UNESCAPED_UNICODE), $aprobacionId]);
@@ -540,7 +799,7 @@ function sol_resolver(PDO $pdo, int $aprobacionId, bool $aprobar, array $ajustes
     $lotes = $pdo->prepare("SELECT DISTINCT i.lote_id FROM proc_lote_item i JOIN proc_lote l ON l.id = i.lote_id WHERE l.estado IN ('BORRADOR', 'VALIDADA')
                              AND (i.id = ? OR UPPER(i.codigo_generico_audifarma) = ? OR UPPER(i.laboratorio) = ? OR UPPER(i.cum) = ?)");
     $lotes->execute([$a['lote_item_id'], _u($datos['cod_gen_audifarma'] ?? $datos['cod_auf'] ?? ''), _u($datos['nombre'] ?? ''), _u($datos['cum_facturar'] ?? '')]);
-    foreach ($lotes->fetchAll(PDO::FETCH_COLUMN) as $l) if ($aprobar) sol_validar($pdo, (int) $l, $usuarioId);
+    foreach ($lotes->fetchAll(PDO::FETCH_COLUMN) as $l) sol_validar($pdo, (int) $l, $usuarioId); // también al rechazar: el producto muestra el motivo
     return ['aprobada' => $aprobar, 'resultado' => $resultado];
 }
 

@@ -293,7 +293,7 @@ function olvidarFiltros() {
   try { Object.keys(sessionStorage).filter((k) => k.startsWith(MEMORIA_FILTROS)).forEach((k) => sessionStorage.removeItem(k)); } catch { /* nada */ }
 }
 
-function tablaPaginada({ cargar, columnas, contenedor, clase = null, alCargar = null, clave = '' }) {
+function tablaPaginada({ cargar, columnas, contenedor, clase = null, alCargar = null, clave = '', descargar = null }) {
   const memoria = claveFiltros(columnas.map((c) => c.titulo || ''), clave);
   const recordado = leerFiltros(memoria);
   let pagina = Math.max(1, Number(recordado?.pagina) || 1);
@@ -362,7 +362,10 @@ function tablaPaginada({ cargar, columnas, contenedor, clase = null, alCargar = 
       ajustarAltoTablas();
     } catch (e) { tbody.replaceChildren(h('tr', {}, h('td', { colspan: columnas.length, class: 'error' }, e.message))); }
   }
-  contenedor.append(h('div', { class: 'barra-tabla' }, limpiar), caja, pie);
+  // descargar (2026-11-17): la tabla como se ve, con sus filtros y todas las páginas
+  const btnDescargar = descargar ? h('button', { type: 'button', class: 'btn primario chico', title: 'Descarga en Excel la tabla como se ve: mismas columnas y filtros, todas las páginas',
+    onclick: () => descargar(JSON.parse(JSON.stringify(filtros))) }, svgIcono('bajar'), 'Descargar') : null;
+  contenedor.append(h('div', { class: 'barra-tabla' }, btnDescargar, limpiar), caja, pie);
   refrescar();
   return { refrescar, filtrar, filtros: () => JSON.parse(JSON.stringify(filtros)) };
 }
@@ -901,6 +904,28 @@ async function productosPorCrear(c) {
     if (!await confirmar('Quitar producto', `Se quita «${p.calculado?.descripcion_generica || p.codigo_generico_audifarma}» de la lista por crear.`, 'Quitar')) return;
     await api('sol_item_eliminar', { metodo: 'POST', datos: { lote_id: id, id: p.id } }); toast('Producto quitado.'); recargar();
   };
+  // ---- lista de chequeo (2026-11-17): marcar varios productos y quitarlos de una vez
+  const marcados = new Set();
+  const casillas = [];
+  const btnQuitarSel = h('button', { type: 'button', class: 'btn sec peligro', style: 'visibility:hidden', onclick: async () => {
+    const n = marcados.size;
+    if (!n || !await confirmar('Quitar productos', `${n === 1 ? 'Se quita 1 producto' : `Se quitan ${miles(n)} productos`} de la lista por crear. Lo pendiente de aprobación que solo ${n === 1 ? 'él usaba' : 'ellos usaban'} (COD GEN, laboratorio, presentación) se deshace en el catálogo.`, `Quitar ${miles(n)}`)) return;
+    const r = await api('sol_items_eliminar', { metodo: 'POST', datos: { lote_id: id, ids: [...marcados] } });
+    toast(`${miles(r.quitados)} ${r.quitados === 1 ? 'producto quitado' : 'productos quitados'}.`); recargar();
+  } }, svgIcono('quitar'), 'Quitar marcados (0)');
+  const casillaTodos = h('input', { type: 'checkbox', title: 'Marcar todos los que se ven (con los filtros actuales)', 'aria-label': 'Marcar todos los visibles' });
+  const pintarMarcados = () => {
+    btnQuitarSel.style.visibility = marcados.size ? '' : 'hidden'; // ocupa su espacio siempre: la tabla no salta al marcar
+    btnQuitarSel.replaceChildren(svgIcono('quitar'), `Quitar marcados (${miles(marcados.size)})`);
+    const visibles = casillas.filter((x) => !x.closest('tr').hidden);
+    casillaTodos.checked = visibles.length > 0 && visibles.every((x) => x.checked);
+    casillaTodos.indeterminate = !casillaTodos.checked && visibles.some((x) => x.checked);
+  };
+  casillaTodos.onchange = () => {
+    casillas.filter((x) => !x.closest('tr').hidden).forEach((x) => { x.checked = casillaTodos.checked; marcados[x.checked ? 'add' : 'delete'](Number(x.value)); });
+    pintarMarcados();
+  };
+  const o = editable ? 1 : 0; // con la casilla, las columnas se corren una posición
   // ---- barra de acciones
   const izquierda = editable ? [
     menu([svgIcono('subir'), 'Cargar Excel ▾'], [['Cargar archivo de productos…', () => cargarProductosExcel(recargar), 'subir'],
@@ -928,7 +953,7 @@ async function productosPorCrear(c) {
   const estadoChip = (k) => h('span', { class: `chip-estado e-${SOL_ESTADOS[k] || 'gris'}` }, svgIcono(ICO[k] || 'pendiente'), ETQ[k] || k);
   const resumenEstados = h('div', { class: 'resumen-estados' }, h('span', { class: 'nota' }, `${miles(d.productos.length)} productos por crear:`),
     ...['VALIDADO', 'CON ALERTA', 'ERROR', 'SIN VALIDAR'].filter((k) => cuenta(k)).map((k) =>
-      h('button', { type: 'button', class: `chip-estado e-${SOL_ESTADOS[k]} chip-filtro`, title: 'Ver solo estos', onclick: () => tabla?.filtrar(0, [ETQ[k]]) },
+      h('button', { type: 'button', class: `chip-estado e-${SOL_ESTADOS[k]} chip-filtro`, title: 'Ver solo estos', onclick: () => tabla?.filtrar(o, [ETQ[k]]) },
         svgIcono(ICO[k]), `${miles(cuenta(k))} ${ETQ[k].toLowerCase()}`)));
   // ---- tabla
   const filas = d.productos.map((p) => {
@@ -936,7 +961,11 @@ async function productosPorCrear(c) {
     const est = p.resultado || 'SIN VALIDAR';
     const primero = p.resultados.find((x) => x.severidad === 'ERROR') || p.resultados[0];
     const motivo = primero ? `${primero.regla_codigo}: ${primero.accion || primero.campo || ''}` : '';
+    const casilla = editable ? h('input', { type: 'checkbox', value: p.id, 'aria-label': 'Marcar para quitar',
+      onchange: (ev) => { marcados[ev.target.checked ? 'add' : 'delete'](p.id); pintarMarcados(); } }) : null;
+    if (casilla) casillas.push(casilla);
     return h('tr', { class: est === 'ERROR' ? 'fila-error' : est === 'CON ALERTA' ? 'fila-alerta' : '' },
+      editable ? h('td', { class: 'col-check' }, casilla) : null,
       h('td', {}, estadoChip(est)),
       h('td', {}, p.codigo_generico_audifarma ?? ''),
       // una sola línea como en Excel: se ve una parte y al pasar el mouse el nombre completo (y en 👁 detalle)
@@ -952,9 +981,10 @@ async function productosPorCrear(c) {
             h('button', { type: 'button', class: 'menu-opcion', onclick: () => productoSolicitud(id, p, listas, recargar) }, svgIcono('editar'), 'Editar'),
             h('button', { type: 'button', class: 'menu-opcion', onclick: () => quitar(p) }, svgIcono('quitar'), 'Quitar'))) : null)));
   });
-  const zona = h('div', { class: 'tarjeta tabla-crear' }, resumenEstados);
-  tabla = tablaConFiltros(['Estado', 'COD AUF', 'Descripción', 'CUM', 'Laboratorio', 'Presentación', 'Código producto', 'Subplanes', 'Acciones'],
-    filas, { sinFiltro: [8], clave: 'productos-por-crear-v3' });
+  if (editable) resumenEstados.append(h('span', { class: 'espacio' }), btnQuitarSel);
+  const zona = h('div', { class: `tarjeta tabla-crear${editable ? ' con-check' : ''}` }, resumenEstados);
+  tabla = tablaConFiltros([...(editable ? [casillaTodos] : []), 'Estado', 'COD AUF', 'Descripción', 'CUM', 'Laboratorio', 'Presentación', 'Código producto', 'Subplanes', 'Acciones'],
+    filas, { sinFiltro: editable ? [0, 9] : [8], clave: editable ? 'productos-por-crear-v4' : 'productos-por-crear-v3' });
   zona.append(tabla);
   c.append(zona);
 }
@@ -1060,6 +1090,94 @@ function comboBuscable(opciones, { valor = '', placeholder = 'Seleccione', busca
   return { el: oculto, caja, establecer: (v) => { oculto.value = v || ''; pintar(); } };
 }
 
+/**
+ * Precio para la Maestra Tarifaria en Crear productos (pedido del usuario, 2026-11-11): quien crea propone el precio de cada línea nueva
+ * (contratos que ya tienen el producto y aún no están en la MT) con la calculadora de precio de venta; el Administrador solo lo aprueba
+ * o lo rechaza con el motivo. CAPITA lleva la tarifa del Listado Cápita; EVENTO / EVENTO SAS, el precio del contrato o el de la calculadora.
+ */
+function seccionPrecioNT(previo) {
+  const caja = h('section', { class: 'seccion-form', hidden: true });
+  let leer = () => null;
+  const ocultar = () => { caja.hidden = true; leer = () => null; };
+  const r2 = (v) => Math.round(Number(v) * 100) / 100;
+  const actualizar = async ({ cod_auf: auf, cum, cod_mutual: idm, iva }) => {
+    if (!auf || !cum) { ocultar(); return; }
+    let sug;
+    try { sug = await api('nt_sugerencia', { params: { cod_auf: auf, cum_facturar: cum, cod_mutual: idm || '' } }); } catch { ocultar(); return; }
+    const fuera = sug.fuera_de_contrato || {};
+    const faltan = (sug.contratos || []).filter((k) => !sug.lineas_existentes.includes(k) && !fuera[k]);
+    if (!faltan.length) { ocultar(); return; }
+    caja.hidden = false;
+    const reg = sug.regulado;
+    const tipo = sug.tipo_producto || '714';
+    const ctr = sug.contrato_evento[tipo] || Object.values(sug.contrato_evento)[0] || null;
+    const tope = (v) => (reg != null && v * (1 + iva) > reg ? reg / (1 + iva) : v);
+    const prev = previo?.lineas || {};
+    const filas = faltan.map((k) => {
+      const b = k === 'CAPITA'
+        ? (sug.tarifa_capita != null ? { pv: tope(sug.tarifa_capita / (1 + iva)), origen: 'LISTADO CAPITA', regla: `Tarifa del Listado Cápita ${pesos(sug.tarifa_capita)} (con IVA)` } : null)
+        : (ctr ? { pv: tope(ctr.valor / (1 + iva)), origen: 'CONTRATO', regla: `Precio del Contrato Evento ${pesos(ctr.valor)} (con IVA)` } : null);
+      const est = prev[k] ? { ...prev[k] } : { precio_venta: b ? r2(b.pv) : null, origen: b?.origen || 'MANUAL', regla: b?.regla || '' };
+      const inp = h('input', { type: 'number', step: '0.01', min: '0', style: 'width:140px' });
+      inp.value = est.precio_venta ?? '';
+      const origen = h('span', { class: 'nota' }, est.regla || '');
+      const maximo = k === 'CAPITA' ? sug.tarifa_capita : (ctr ? Number(ctr.valor) : null); // con IVA
+      const aviso = h('div', { class: 'error' });
+      const revisar = () => {
+        const fin = Number(inp.value) * (1 + iva);
+        aviso.textContent = inp.value === '' ? 'Digite el precio de venta'
+          : maximo != null && fin > maximo + 0.5 ? `Con IVA (${pesos(fin)}) supera ${k === 'CAPITA' ? 'la tarifa del Listado Cápita' : 'el precio del contrato'} (${pesos(maximo)})`
+            : reg != null && fin > reg + 0.5 ? `Con IVA (${pesos(fin)}) supera el precio regulado (${pesos(reg)})` : '';
+      };
+      inp.addEventListener('input', () => {
+        Object.assign(est, { precio_venta: inp.value, origen: 'MANUAL', regla: 'Digitado por quien crea' }); delete est.precio_compra; delete est.porcentaje;
+        origen.textContent = est.regla; revisar();
+      });
+      revisar();
+      return { k, est, inp, origen, revisar, fila: h('tr', {}, h('td', {}, chip(lineaNT(k), 'info')), h('td', {}, inp, aviso), h('td', {}, origen)) };
+    });
+    // calculadora de precio de venta: precio de compra + margen (el % por defecto es el parámetro del aplicativo)
+    const compra = h('input', { type: 'number', step: '0.01', min: '0', placeholder: 'ej. 10000', style: 'width:130px' });
+    const pct = h('input', { type: 'number', step: '0.1', style: 'width:80px' });
+    pct.value = sug.porcentaje;
+    const resultado = h('strong', {});
+    const conCalc = filas.filter((x) => x.k !== 'CAPITA'); // CAPITA va con la tarifa del Listado Cápita
+    const usar = h('button', { type: 'button', class: 'btn sec chico', disabled: true }, 'Usar este precio');
+    let calc = null;
+    const calcular = () => {
+      const pc = Number(compra.value); const p = Number(pct.value || 0);
+      if (!pc) { calc = null; resultado.textContent = ''; usar.disabled = true; return; }
+      calc = { pv: r2(pc * (1 + p / 100)), pc, p };
+      resultado.textContent = `= ${pesos(calc.pv)} sin IVA${iva ? ` (${pesos(calc.pv * (1 + iva))} con IVA)` : ''}`;
+      usar.disabled = !conCalc.length;
+    };
+    compra.addEventListener('input', calcular); pct.addEventListener('input', calcular);
+    usar.onclick = () => {
+      if (!calc) return;
+      conCalc.forEach((x) => {
+        Object.assign(x.est, { precio_venta: calc.pv, origen: 'CALCULADORA', regla: `Calculadora: compra ${pesos(calc.pc)} + ${calc.p} % = ${pesos(calc.pv)}`, precio_compra: calc.pc, porcentaje: calc.p });
+        x.inp.value = calc.pv; x.origen.textContent = x.est.regla; x.revisar();
+      });
+    };
+    const conPrevio = Object.values(prev).find((x) => x.precio_compra);
+    if (conPrevio) { compra.value = conPrevio.precio_compra; pct.value = conPrevio.porcentaje ?? pct.value; calcular(); }
+    const dato = (t, v) => h('div', { class: 'dato' }, h('span', {}, t), h('strong', {}, v));
+    caja.replaceChildren(h('h3', {}, h('span', { class: 'sec-num' }, '5'), 'Precio para la Maestra Tarifaria'),
+      h('p', { class: 'nota' }, `El producto ya está en el contrato pero aún no en la Maestra Tarifaria (${faltan.map(lineaNT).join(', ')}). `
+        + 'Proponga el precio de venta: el Administrador lo revisa y aprueba la inclusión (no lo vuelve a digitar).'),
+      h('div', { class: 'datos-rejilla' },
+        dato('Contrato Evento (con IVA)', ctr ? pesos(ctr.valor) : '—'), dato('Tarifa Listado Cápita (con IVA)', sug.tarifa_capita != null ? pesos(sug.tarifa_capita) : '—'),
+        dato('Precio regulado (tope con IVA)', reg != null ? pesos(reg) : 'No regulado'), dato('ID MUTUAL', idm || sug.cod_mutual || '—')),
+      h('div', { class: 'nt-calc' }, h('strong', {}, 'Calculadora de precio de venta:'), 'Precio de compra', compra, '+ margen', pct, '%', resultado, usar,
+        h('span', { class: 'nota', style: 'width:100%' }, 'Ejemplo: compra $ 10.000 + margen 20 % = precio de venta $ 12.000 (sin IVA). «Usar este precio» lo pone en las líneas EVENTO; '
+          + 'la línea CAPITA lleva la tarifa del Listado Cápita. También puede digitar el precio de cada línea.')),
+      h('table', { class: 'nt-tabla-lineas' }, h('thead', {}, h('tr', {}, h('th', {}, 'Línea'), h('th', {}, 'Precio de venta (sin IVA)'), h('th', {}, 'Cómo se calculó'))),
+        h('tbody', {}, ...filas.map((x) => x.fila))));
+    leer = () => ({ cod_mutual: idm || sug.cod_mutual || '', lineas: Object.fromEntries(filas.map((x) => [x.k, { ...x.est, precio_venta: x.inp.value }])) });
+  };
+  return { el: caja, actualizar, leer: () => leer() };
+}
+
 function productoSolicitud(loteId, p, listas, alGuardar) {
   const dlg = $('#dialogo');
   const form = $('#dialogo-form');
@@ -1120,10 +1238,14 @@ function productoSolicitud(loteId, p, listas, alGuardar) {
   };
   const asignar = campo('asignar_pos', 'Asignar POS / NO POS (lo aprueba el Administrador)', { opciones: opciones(['POS', 'NO POS']), valor: prop.asignar_pos });
   const unidadOrden = campo('unidad_orden', 'Unidad de orden de la presentación nueva (ej. CX30)', { valor: prop.presentacion?.unidad_orden });
-  const secMolecula = h('fieldset', { hidden: true }, h('legend', {}, 'Molécula nueva (COD GEN): se envía a aprobación del Administrador'), ...Object.values(mol).map((x) => x.label),
-    h('p', { class: 'nota ancho-total' }, 'El Código Medicar (COD_GEN_SIESA) es automático: se asigna el siguiente consecutivo libre cuando el Administrador aprueba la molécula.'));
-  const secAsignar = h('fieldset', { hidden: true }, h('legend', {}, 'COD GEN en «ASIGNAR»'), asignar.label);
-  const secPresentacion = h('fieldset', { hidden: true }, h('legend', {}, 'Presentación nueva: se envía a aprobación del Administrador'), unidadOrden.label);
+  // (2026-11-11) lo nuevo se crea al validar, sin esperar; el Administrador lo aprueba y la creación (archivos) espera esa aprobación
+  const secMolecula = h('fieldset', { hidden: true }, h('legend', {}, 'Molécula nueva (COD GEN): se crea al validar y el Administrador la aprueba'), ...Object.values(mol).map((x) => x.label),
+    h('p', { class: 'nota ancho-total' }, 'El Código Medicar (COD_GEN_SIESA) es automático: se asigna el siguiente consecutivo libre al validar. Los archivos de cargue esperan la aprobación.'));
+  const secAsignar = h('fieldset', { hidden: true }, h('legend', {}, 'COD GEN en «ASIGNAR»: se asigna al validar y el Administrador lo aprueba'), asignar.label);
+  const secPresentacion = h('fieldset', { hidden: true }, h('legend', {}, 'Presentación nueva: se crea al validar y el Administrador la aprueba'), unidadOrden.label);
+  const precioNt = seccionPrecioNT(prop.nt || null);
+  const actualizarPrecio = () => precioNt.actualizar({ cod_auf: f.codigo_generico_audifarma.el.value.trim(), cum: f.cum.el.value.trim(),
+    cod_mutual: idMutual.value, iva: f.iva.el.value === 'CON IVA' ? 0.19 : 0 });
   const infoAuf = h('div', { class: 'nota' });
   const idMutual = h('input', { readonly: true, class: 'solo-lectura', placeholder: 'Se llena con el CUM', value: ini.calculado?.cod_mutual || '' });
   const notaIdMutual = h('span', { class: 'nota' }, ini.calculado?.cod_mutual ? 'De la Maestra Tarifaria' : '');
@@ -1157,7 +1279,7 @@ function productoSolicitud(loteId, p, listas, alGuardar) {
     const lab = f.laboratorio.el.value.trim();
     const igual = lab ? labPorClave.get(claveLab(lab)) : null;
     infoLab.hidden = !lab || igual === lab.toUpperCase() || igual === lab;
-    infoLab.replaceChildren(svgIcono('pendiente'), h('span', {}, igual ? h('span', {}, 'Se usará el laboratorio del catálogo: ', h('strong', {}, igual)) : h('span', {}, h('strong', {}, 'Laboratorio nuevo: '), 'se envía a aprobación del Administrador al validar.')));
+    infoLab.replaceChildren(svgIcono('pendiente'), h('span', {}, igual ? h('span', {}, 'Se usará el laboratorio del catálogo: ', h('strong', {}, igual)) : h('span', {}, h('strong', {}, 'Laboratorio nuevo: '), 'se crea al validar y el Administrador lo aprueba.')));
     const pres = f.presentacion_1.el.value && f.unidad_presentacion.el.value ? `${f.presentacion_1.el.value} X ${Number(f.unidad_presentacion.el.value)}`.toUpperCase() : '';
     secPresentacion.hidden = !pres || listas.presentaciones.map((x) => x.toUpperCase()).includes(pres);
   };
@@ -1171,7 +1293,7 @@ function productoSolicitud(loteId, p, listas, alGuardar) {
       secMolecula.hidden = !auf || !!m;
       secAsignar.hidden = !(m && String(m.pos_no_pos).toUpperCase() === 'ASIGNAR');
       infoAuf.replaceChildren(!auf ? '' : m ? h('span', {}, chip('COD GEN', 'ok'), ` ${m.descripcion_general} · Cód. Medicar ${m.codigo_medicar || '—'} · ${m.pos_no_pos || ''}`)
-        : h('span', { class: 'alerta-txt' }, 'No existe en COD GEN: diligencie la molécula abajo; el Administrador aprueba su creación.'));
+        : h('span', { class: 'alerta-txt' }, 'No existe en COD GEN: diligencie la molécula abajo; se crea al validar y el Administrador la aprueba.'));
       const inv = auto.invima; const mu = auto.mutual;
       if (inv) {
         poner('registro_sanitario', inv.registro_sanitario, 'De INVIMA');
@@ -1195,12 +1317,14 @@ function productoSolicitud(loteId, p, listas, alGuardar) {
           : porAuf ? `De la Maestra Tarifaria por el COD AUF ${auf} (línea ${porAuf.contrato}, CUM ${porAuf.cum_facturar}): el CUM no tiene ID MUTUAL` : (cum ? 'Sin ID MUTUAL para este CUM ni para el COD AUF' : '');
       if (cum && !inv && !['NO APLICA', 'VITAL NO DISPONIBLE', 'PREPARADO MAGISTRAL'].includes(cum.toUpperCase())) f.cum.nota.textContent = 'El CUM no está en INVIMA';
       else f.cum.nota.textContent = '';
+      actualizarPrecio();
     } catch (e) { err.textContent = e.message; }
   };
   const alCambiar = () => { clearTimeout(espera); espera = setTimeout(consultar, 400); };
   f.codigo_generico_audifarma.el.addEventListener('input', alCambiar);
   f.cum.el.addEventListener('input', alCambiar);
   for (const k of ['laboratorio', 'presentacion_1', 'unidad_presentacion']) { f[k].el.addEventListener('input', revisarCatalogos); f[k].el.addEventListener('change', revisarCatalogos); }
+  f.iva.el.addEventListener('change', actualizarPrecio);
 
   // ---- presentación: encabezado con pasos, secciones numeradas y pie fijo (fase 10)
   // el asterisco va junto al nombre del campo (el label es una rejilla: texto y asterisco en un mismo bloque)
@@ -1219,7 +1343,8 @@ function productoSolicitud(loteId, p, listas, alGuardar) {
     seccion(3, 'Laboratorio y presentación', h('div', { class: 'ancho-doble' }, f.laboratorio.label, infoLab), f.presentacion_1.label, f.unidad_presentacion.label),
     secPresentacion,
     seccion(4, 'Información RIPS', f.forma_farmaceutica_rips.label, f.concentracion_rips.label, f.unidad_medida_rips.label,
-      h('div', { class: 'info-azul ancho-total' }, svgIcono('pendiente'), h('span', {}, 'El subplán, la categoría PBS, el precio y el código de producto se calculan al validar.'))));
+      h('div', { class: 'info-azul ancho-total' }, svgIcono('pendiente'), h('span', {}, 'El subplán, la categoría PBS, el precio y el código de producto se calculan al validar.'))),
+    precioNt.el);
   const vistaResultado = h('div', { class: 'form-cuerpo', hidden: true });
   const btnCancelar = h('button', { class: 'btn sec', value: 'cancelar', formnovalidate: true }, 'Cancelar');
   const btnGuardar = h('button', { class: 'btn primario', value: 'ok' }, 'Validar y guardar');
@@ -1240,12 +1365,15 @@ function productoSolicitud(loteId, p, listas, alGuardar) {
     if (!x) { dlg.close(); alGuardar(); return; }
     const k = x.calculado || {};
     const listo = ['VALIDADO', 'CON ALERTA'].includes(x.resultado);
+    const espera = listo && x.resultados.some((r) => r.regla_codigo === 'A09'); // pendiente de aprobación del Administrador
     marcarPaso(listo ? 3 : 2);
     vistaForm.hidden = true; vistaResultado.hidden = false;
     vistaResultado.replaceChildren(h('section', { class: 'seccion-form' },
       h('div', { class: `resultado-caja ${listo ? (x.resultado === 'VALIDADO' ? 'r-ok' : 'r-alerta') : 'r-error'}` }, svgIcono(listo ? (x.resultado === 'VALIDADO' ? 'ok' : 'alerta') : 'error', 'ico-resultado'),
-        h('div', {}, h('strong', {}, listo ? (x.resultado === 'VALIDADO' ? 'Producto listo para crear' : 'Producto listo para crear, con advertencias') : 'El producto tiene errores y no se puede crear todavía'),
-          h('p', { class: 'nota' }, listo ? 'Quedó en la lista; se crea con el botón «Crear productos».' : 'Quedó guardado en la lista. Corrija los datos o espere las aprobaciones indicadas.'))),
+        h('div', {}, h('strong', {}, espera ? 'Producto validado: espera la aprobación del Administrador'
+          : listo ? (x.resultado === 'VALIDADO' ? 'Producto listo para crear' : 'Producto listo para crear, con advertencias') : 'El producto tiene errores y no se puede crear todavía'),
+          h('p', { class: 'nota' }, espera ? 'Lo nuevo ya quedó creado y enviado al Administrador. Cuando lo apruebe, el producto se crea con el botón «Crear productos».'
+            : listo ? 'Quedó en la lista; se crea con el botón «Crear productos».' : 'Quedó guardado en la lista. Corrija los datos indicados y valide de nuevo.'))),
       h('div', { class: 'datos-rejilla', style: 'margin:12px 0' },
         h('div', { class: 'dato' }, h('span', {}, 'Código producto'), h('strong', {}, x.codigo_producto_completo || '—')),
         h('div', { class: 'dato' }, h('span', {}, 'Descripción'), h('strong', {}, k.descripcion_generica || '—')),
@@ -1273,6 +1401,8 @@ function productoSolicitud(loteId, p, listas, alGuardar) {
     if (!secMolecula.hidden) datos.molecula_nueva = Object.fromEntries(Object.entries(mol).map(([k, x]) => [k, x.el.value]));
     if (!secAsignar.hidden && asignar.el.value) datos.asignar_pos = asignar.el.value;
     if (!secPresentacion.hidden) datos.presentacion_nueva = { unidad_orden: unidadOrden.el.value.trim().toUpperCase() };
+    const pn = precioNt.leer();
+    if (pn) datos.nt_propuesta = pn;
     btnGuardar.disabled = true; btnGuardar.textContent = 'Validando…';
     try {
       const r = await api('sol_item_guardar', { metodo: 'POST', datos });
@@ -1370,55 +1500,51 @@ async function historialCreaciones() {
 /** Aprobaciones del Administrador: revisa los datos, los ajusta si hace falta y aprueba (se aplica en el catálogo / Maestra Tarifaria) o rechaza. */
 async function panelAprobaciones(alCambiar) {
   const r = await api('sol_aprobaciones');
-  const resolver = async (a, aprobar, ajustes = {}, motivo = '') => {
-    await api('sol_resolver', { metodo: 'POST', datos: { id: a.id, aprobar, ajustes, motivo } });
-    toast(aprobar ? 'Aprobado: se aplicó y las solicitudes se revalidaron.' : 'Rechazado.'); alCambiar();
+  // (2026-11-11) el Administrador revisa lo que registró el usuario de creación y solo aprueba o rechaza (con el motivo, para que lo corrija);
+  // no vuelve a digitar datos ni precios
+  const volver = () => setTimeout(() => panelAprobaciones(alCambiar), 60);
+  const resolver = async (a, aprobar, motivo = '') => {
+    await api('sol_resolver', { metodo: 'POST', datos: { id: a.id, aprobar, motivo } });
+    toast(aprobar ? 'Aprobado: se aplicó y las solicitudes se revalidaron.' : 'Rechazado: el usuario de creación ve el motivo para corregir.'); alCambiar();
   };
-  const aprobar = (a) => {
+  const aprobar = async (a) => {
     const d = a.datos || {};
-    if (a.tipo === 'INCLUIR_NT') { // se revisa en el formulario «Nuevo» de la Maestra Tarifaria y con Guardar se incluye
-      nuevoNT(() => resolver(a, true, { _ya_incluido: true }, 'Incluido en la Maestra Tarifaria'), { cod_auf: d.cod_auf, cum_facturar: d.cum_facturar, cum: d.cum, cod_mutual: d.cod_mutual,
-        _aprobacion: { por: a.solicitado_por_nombre || '—', origen: `fila ${a.fila} de Crear productos`, volver: () => panelAprobaciones(alCambiar) } });
-      return;
-    }
-    const campos = {
-      MOLECULA: [['cod_gen_audifarma', 'Código genérico Audifarma'], ['descripcion_general', 'Descripción genérica'], ['concentracion_agrupada', 'Concentración'],
-        ['principio_activo', 'Principio activo'], ['forma_farmaceutica', 'Forma farmacéutica'], ['grupo_farmacologico', 'Grupo farmacológico'], ['via_administracion', 'Vía'],
-        ['pos_no_pos', 'POS / NO POS'], ['cadena_frio', 'Cadena de frío'], ['clasificacion_entrega', 'Clasificación de entrega']],
-      LABORATORIO: [['nombre', 'Nombre del laboratorio']],
-      PRESENTACION: [['envase', 'Envase'], ['cantidad', 'Cantidad'], ['unidad_orden', 'Unidad de orden']],
-      ASIGNAR_POS: [['cod_gen_audifarma', 'COD GEN'], ['pos_no_pos', 'POS / NO POS']],
-    }[a.tipo] || [];
-    dialogo({
-      titulo: `Aprobar: ${SOL_TIPOS_APROBACION[a.tipo]}`, texto: `Producto fila ${a.fila}. Revise y corrija si hace falta: al aprobar se aplica en el catálogo y se revalida.`
-        + (a.tipo === 'MOLECULA' ? ' El Código Medicar se asigna solo (siguiente consecutivo libre).' : ''),
-      campos: campos.map(([k, t]) => (k === 'pos_no_pos' ? { nombre: k, etiqueta: t, tipo: 'select', valor: d[k], opciones: [['POS', 'POS'], ['NO POS', 'NO POS']] }
-        : k === 'clasificacion_entrega' ? { nombre: k, etiqueta: t, tipo: 'select', valor: d[k] ?? '', requerido: true,
-          opciones: [['', 'Seleccione…'], ['MTOS DE APLICACION', 'MTOS DE APLICACIÓN'], ['ALTO COSTO', 'ALTO COSTO'], ['AMBULATORIO', 'AMBULATORIO']] }
-        : { nombre: k, etiqueta: t, valor: d[k] ?? '', requerido: !['cadena_frio'].includes(k) })),
-      aceptar: 'Aprobar',
-      alEnviar: (v) => resolver(a, true, v),
-    });
+    const que = a.tipo === 'INCLUIR_NT' ? `la línea ${lineaNT(d.contrato)} del CUM ${d.cum_facturar} en la Maestra Tarifaria con precio de venta ${pesos(d.precio_venta)} (sin IVA)`
+      : `${SOL_TIPOS_APROBACION[a.tipo] || a.tipo}: ${a.clave}`;
+    if (!await confirmar('Aprobar', `Se aprueba ${que}, tal como lo registró ${a.solicitado_por_nombre || 'el usuario de creación'}.`, 'Aprobar')) { volver(); return; }
+    try { await resolver(a, true); } catch (e) { toast(e.message, true); }
+    volver();
   };
   const rechazar = (a) => dialogo({
-    titulo: 'Rechazar', texto: 'El producto sigue en error hasta que se corrija.', campos: [{ nombre: 'motivo', etiqueta: 'Motivo', requerido: true }], aceptar: 'Rechazar',
-    alEnviar: (v) => resolver(a, false, {}, v.motivo),
+    titulo: 'Rechazar', texto: 'El usuario de creación ve el motivo, corrige y vuelve a enviar. Lo que se creó queda inactivo mientras tanto.',
+    campos: [{ nombre: 'motivo', etiqueta: 'Motivo del rechazo', requerido: true }], aceptar: 'Rechazar',
+    alEnviar: async (v) => { await resolver(a, false, v.motivo); volver(); },
   });
   // Una tarjeta por solicitud (fase 10): qué se pide, para qué producto, los datos con su nombre y las acciones.
   const ETQ_DATO = { cum_facturar: 'CUM a facturar', cod_auf: 'COD AUF', cod_gen_audifarma: 'COD GEN', contrato: 'Línea', descripcion: 'Descripción',
     descripcion_general: 'Descripción genérica', cum: 'CUM', cod_mutual: 'ID MUTUAL', nombre: 'Laboratorio', envase: 'Envase', cantidad: 'Cantidad',
     unidad_orden: 'Unidad de orden', pos_no_pos: 'POS / NO POS', codigo_medicar: 'Cód. Medicar', concentracion_agrupada: 'Concentración',
     principio_activo: 'Principio activo', forma_farmaceutica: 'Forma farmacéutica', grupo_farmacologico: 'Grupo farmacológico', via_administracion: 'Vía', cadena_frio: 'Cadena de frío' };
-  const AYUDA = { INCLUIR_NT: 'Al aprobar se abre el formulario de la Maestra Tarifaria con estos datos para revisar el ID MUTUAL y el precio; con «Aprobar e incluir» se crean las líneas.' };
+  const AYUDA = { INCLUIR_NT: 'Revise el ID MUTUAL y el precio que propuso el usuario de creación: al aprobar se crea la línea en la Maestra Tarifaria con esos datos.' };
+  // datos de la tarjeta: precio, IVA, cómo se calculó y los precios de referencia
+  const datosTarjeta = (d) => Object.entries(d).filter(([k, v]) => !k.startsWith('_') && v !== null && v !== '').flatMap(([k, v]) => {
+    const dato = (t, x) => h('div', { class: 'dato' }, h('span', {}, t), h('strong', {}, x));
+    if (k === 'precio_venta') return [dato('Precio de venta (sin IVA)', pesos(v)), dato('Precio final + IVA', pesos(Number(v) * (1 + Number(d.iva || 0))))];
+    if (k === 'iva') return [dato('IVA', `${Math.round(Number(v) * 100)} %`)];
+    if (k === 'calculo') return [dato('Cómo se calculó', v.regla || v.origen || '—')];
+    if (k === 'referencia') return [dato('Precio del contrato (con IVA)', v.precio_contrato != null ? pesos(v.precio_contrato) : '—'),
+      dato('Tarifa Listado Cápita (con IVA)', v.tarifa_capita != null ? pesos(v.tarifa_capita) : '—'), dato('Precio regulado (tope)', v.precio_regulado != null ? pesos(v.precio_regulado) : 'No regulado')];
+    if (typeof v === 'object') return [];
+    return [dato(ETQ_DATO[k] || k.replace(/_/g, ' '), String(v))];
+  });
   const tarjetas = r.pendientes.map((a) => h('article', { class: 'aprob-tarjeta', dataset: { tipo: a.tipo } },
     h('div', { class: 'aprob-cab' },
       h('span', { class: 'chip-estado e-alerta' }, svgIcono('pendiente'), SOL_TIPOS_APROBACION[a.tipo] || a.tipo),
-      h('span', { class: 'aprob-origen' }, `Fila ${a.fila} · COD AUF ${a.codigo_generico_audifarma ?? '—'} · CUM ${a.cum ?? '—'}`),
+      h('span', { class: 'aprob-origen' }, a.lote_item_id ? `Fila ${a.fila} · COD AUF ${a.codigo_generico_audifarma ?? '—'} · CUM ${a.cum ?? '—'}` : 'Creado en el catálogo COD GEN (sin producto)'),
       h('span', { class: 'espacio' }),
       h('span', { class: 'nota' }, `${a.solicitado_por_nombre ?? ''} · ${(a.solicitado_en || '').slice(0, 16)}`)),
-    h('div', { class: 'datos-rejilla' }, ...Object.entries(a.datos || {}).filter(([k, v]) => !k.startsWith('_') && v !== null && v !== '')
-      .map(([k, v]) => h('div', { class: 'dato' }, h('span', {}, ETQ_DATO[k] || k.replace(/_/g, ' ')), h('strong', {}, String(v))))),
-    h('div', { class: 'aprob-pie' }, h('span', { class: 'nota' }, AYUDA[a.tipo] || 'Al aprobar puede revisar y corregir los datos antes de aplicarlos en el catálogo.'),
+    h('div', { class: 'datos-rejilla' }, ...datosTarjeta(a.datos || {})),
+    h('div', { class: 'aprob-pie' }, h('span', { class: 'nota' }, AYUDA[a.tipo] || 'Ya quedó creado como lo registró el usuario de creación: apruébelo si está correcto o recházelo con el motivo para que lo corrija.'),
       h('span', { class: 'espacio' }),
       // type=button: están dentro del formulario del diálogo; sin él, el clic también enviaba el formulario de edición
       // y se aprobaba sin dejar corregir los datos
@@ -1438,7 +1564,7 @@ async function panelAprobaciones(alCambiar) {
   dlg.onclose = null; dlg.oncancel = null;
   const encabezado = h('div', { class: 'form-encabezado' },
     h('div', {}, h('h2', {}, 'Aprobaciones pendientes'),
-      h('p', { class: 'nota' }, r.pendientes.length ? 'Productos de Crear productos que esperan una decisión del Administrador. Al aprobar o rechazar, se revalidan.' : 'No hay solicitudes por resolver.')),
+      h('p', { class: 'nota' }, r.pendientes.length ? 'Lo que registró el usuario de creación y espera su aprobación. Al aprobar o rechazar, los productos se revalidan.' : 'No hay solicitudes por resolver.')),
     h('button', { type: 'button', class: 'btn-icono cerrar-x', 'aria-label': 'Cerrar', onclick: () => dlg.close() }, '✕'));
   form.replaceChildren(encabezado,
     r.pendientes.length ? h('div', { class: 'resumen-estados' }, h('span', { class: 'nota' }, `${miles(r.pendientes.length)} pendientes:`), ...chips) : '',
@@ -1505,13 +1631,12 @@ async function pNota(c) {
     const opcion = (texto, titulo, accion) => h('button', { type: 'button', class: 'menu-opcion', title: titulo, onclick: (ev) => { ev.target.closest('details').open = false; accion(); } }, texto);
     return h('details', { class: 'menu-exportar' }, h('summary', { class: 'btn sec' }, svgIcono('bajar'), 'Exportar ▾'),
       h('div', { class: 'menu-lista' },
-        opcion('Toda la Maestra Tarifaria', 'Todas las líneas activas', () => { window.location.href = 'api.php?accion=nt_exportar'; }),
+        opcion('Toda la Maestra Tarifaria', 'Todas las líneas, activas e inactivas, como se ven en la tabla', () => { window.location.href = 'api.php?accion=nt_exportar'; }),
         opcion('Lo filtrado en la tabla', 'Las filas que se ven con los filtros actuales', () => descargar(false)),
         opcion('Errores a corregir', 'Solo las líneas con error o alerta (con los filtros actuales), con la observación y cómo corregirla', () => descargar(true))));
   };
   const pintarResumen = (x) => {
     ultimo = x;
-    const porAgregar = (x.capita_por_agregar || 0) + (x.evento_sas_por_agregar || 0);
     // Resumen (diseño fase 10): total, estados que filtran y las reglas con casos en un desplegable
     const item = (ico, n, texto, k, clave) => h('button', { type: 'button', class: `nt-res-item r-${k}`, title: 'Ver solo estas líneas',
       onclick: () => { verRegla(null); tabla?.filtrar({ estado: [clave] }); } }, svgIcono(ico), h('strong', {}, miles(n)), h('span', {}, texto));
@@ -1535,7 +1660,7 @@ async function pNota(c) {
       h('div', { class: 'grupo-acciones' },
         gestionar ? h('button', { class: 'btn primario', onclick: () => editarNT(null, recargar) }, svgIcono('mas'), 'Nuevo producto') : '',
         gestionar ? botonPanel('importar', 'Importar Excel', () => panelImportarNT(true, recargar), 'subir') : '',
-        porAgregar ? botonPanel('agregar', `Por agregar (${miles(porAgregar)})`, () => panelPorAgregar(porAgregar, gestionar, recargar), 'crear') : '',
+        // «Por agregar» retirado (decisión del usuario, 2026-11-11): los productos nuevos entran por Crear productos
         x.precio_uno_pendiente ? botonPanel('uno', `Precio 1 por aprobar (${miles(x.precio_uno_pendiente)})`, () => panelPrecioUno(gestionar, recargar), 'aprobar') : ''),
       h('div', { class: 'grupo-acciones' },
         // pendientes: solo aparecen mientras haya algo por hacer
@@ -1703,47 +1828,6 @@ async function pNota(c) {
 }
 
 /**
- * Por AGREGAR: productos del Listado Cápita y del Listado EVENTO SAS que no están en la Maestra Tarifaria, con las
- * MISMAS columnas de la Maestra Tarifaria (prellenadas). Se descargan en Excel, se completan y se cargan con la importación.
- */
-function panelPorAgregar(total, gestionar, alAgregar) {
-  const zona = h('div', {}, h('p', { class: 'nota' }, 'Cargando…'));
-  const det = h('details', { class: 'tarjeta', style: 'margin-bottom:12px' },
-    h('summary', { style: 'cursor:pointer;font-weight:600' }, `Por AGREGAR: ${miles(total)} códigos de los listados (Cápita y EVENTO SAS) que no están en la Maestra Tarifaria`),
-    gestionar ? h('ol', { class: 'nota' },
-      h('li', {}, 'Descargue el Excel: trae estos códigos con las columnas de la Maestra Tarifaria, prellenadas con el listado de origen (COD AUF, ID MUTUAL, CUM, descripción), el tipo y precio (tarifa de cápita o precio del Contrato Evento sin IVA) y el Maestro SIESA (COD GEN SIESA e IVA).'),
-      h('li', {}, 'Complete lo que falte (ver la columna OBSERVACION) y corrija lo que sea necesario.'),
-      h('li', {}, 'Cárguelo aquí abajo: se muestra la vista previa y, al aplicar, los productos quedan en la Maestra Tarifaria y se validan.')) : h('p', { class: 'nota' }, 'Solo el Administrador puede agregarlos.'),
-    gestionar ? h('div', { class: 'fila-acciones', style: 'margin-bottom:8px' }, h('a', { class: 'btn sec', href: 'api.php?accion=nt_por_agregar_plantilla' }, '⬇ Descargar Excel para diligenciar')) : null,
-    gestionar ? panelImportarNT(true, alAgregar, 'Cargar el Excel diligenciado') : null,
-    zona);
-  let carga = null;
-  let tablaLocal = null;
-  const cargar = () => (carga ??= (async () => {
-    try {
-      const r = await api('nt_por_agregar');
-      const campos = Object.keys(r.columnas);
-      const celda = (x, k) => (k === 'precio_venta' ? (x[k] === null ? '' : Number(x[k]).toLocaleString('es-CO', { maximumFractionDigits: 2 })) : k === 'iva' ? String(Number(x[k])).replace('.', ',') : (x[k] ?? ''));
-      const filas = r.filas.map((x) => h('tr', {},
-        h('td', {}, x.listado),
-        ...campos.map((k) => h('td', { class: ['precio_venta', 'iva'].includes(k) ? 'num' : null }, celda(x, k))),
-        h('td', {}, x.observacion ? h('span', { class: 'alerta-txt' }, x.observacion) : ''),
-        h('td', {}, chip('AGREGAR', 'alerta'), ' ', gestionar ? h('button', { class: 'btn sec chico', onclick: () => editarNT(null, alAgregar, x) }, 'Agregar uno') : null)));
-      tablaLocal = tablaConFiltros(['LISTADO', ...Object.values(r.columnas), 'OBSERVACION', ''], filas, { sinFiltro: [campos.length + 2], alto: 420 });
-      zona.replaceChildren(tablaLocal);
-    } catch (e) { zona.replaceChildren(h('p', { class: 'error' }, e.message)); }
-  })());
-  det.addEventListener('toggle', () => { if (det.open && total) cargar(); });
-  // Desde los indicadores: abre el panel y deja solo el listado indicado (filtro de la columna LISTADO)
-  det.mostrar = async (listado) => {
-    det.open = true;
-    await cargar();
-    if (listado) tablaLocal?.filtrar?.(0, [listado]);
-  };
-  return det;
-}
-
-/**
  * Excepción de precio 1 (4.10): todas las líneas con precio de venta 1 en una sola lista, para aprobarlas
  * (o retirar la aprobación) en bloque. Solo el Administrador aprueba; si el precio cambia, la aprobación se pierde.
  */
@@ -1822,12 +1906,14 @@ function nuevoNT(alGuardar, base = {}) {
     cod_mutual: campo('cod_mutual', 'COD MUTUAL (ID MUTUAL)', { valor: base.cod_mutual }),
     iva: campo('iva', 'IVA', { tipo: 'select', valor: String(Number(base.iva) ? 0.19 : 0), opciones: [['0', '0 %'], ['0.19', '19 %']] }),
   };
+  // (2026-11-11) descripción y COD GEN SIESA salen del catálogo COD GEN por el COD AUF, como en la ventana de edición: no se digitan
+  for (const k of ['descripcion', 'cod_gen_siesa']) { c[k].el.readOnly = true; c[k].el.classList.add('solo-lectura'); c[k].el.tabIndex = -1; }
   // Líneas que se crean (una por contrato) con su precio; el precio de cada una se puede corregir a mano.
   const lineasZona = h('div', { class: 'nt-lineas' });
   let lineas = [];
   const precioManual = {};
   // calculadora DOC CRIS
-  const compra = h('input', { type: 'number', step: '0.01', placeholder: 'precio de compra' });
+  const compra = h('input', { type: 'number', step: '0.01', placeholder: 'ej. 10000' });
   const pct = h('input', { type: 'number', step: '0.1', style: 'width:80px' });
   const resultadoCalc = h('span', { class: 'nota' });
   const avisoAuf = h('div');
@@ -1863,19 +1949,20 @@ function nuevoNT(alGuardar, base = {}) {
       if (k === 'CAPITA') b = capita;
       else if (ctr) b = { pv: tope(ctr.valor / (1 + iva)), origen: 'CONTRATO', regla: ctr.valor * 1 > (reg ?? Infinity) ? `Contrato ${fmt(ctr.valor)} supera el regulado: se usa el regulado` : `Precio del contrato ${fmt(ctr.valor)}` };
       else b = { ...(capita ? { ...capita, origen: 'COPIA', regla: 'Precio de cápita' } : calc || { pv: null, origen: null, regla: 'Digite el precio de compra en la calculadora' }) };
-      const sinContrato = k !== 'CAPITA' && !ctr;
-      return { contrato: k, existe, sinContrato, ...b };
+      // (2026-11-11) solo entra a la Maestra Tarifaria la línea cuyo contrato ya tiene el producto
+      const fuera = (sug.fuera_de_contrato || {})[k] || null;
+      return { contrato: k, existe, sinContrato: !!fuera, fuera, ...b };
     });
     lineasZona.replaceChildren(h('table', { class: 'nt-tabla-lineas' },
       h('thead', {}, h('tr', {}, h('th', {}, 'Línea'), h('th', {}, 'PRECIO DE VENTA (sin IVA)'), h('th', {}, 'Origen del precio'))),
       h('tbody', {}, ...lineas.map((l) => {
-        const inp = h('input', { type: 'number', step: '0.01', style: 'width:130px', disabled: l.existe,
+        const inp = h('input', { type: 'number', step: '0.01', style: 'width:130px', disabled: l.existe || l.sinContrato,
           oninput: () => { precioManual[l.contrato] = inp.value; } });
         inp.value = precioManual[l.contrato] ?? (l.pv === null ? '' : Math.round(l.pv * 100) / 100);
         l.input = inp;
         return h('tr', {},
           h('td', {}, chip(lineaNT(l.contrato), l.existe ? 'gris' : 'info'), l.existe ? h('div', { class: 'nota' }, 'Ya existe: no se crea') : '',
-            l.sinContrato && !l.existe ? h('div', { class: 'error' }, 'El ID MUTUAL no está en el Contrato Evento: quedará con error NT01') : ''),
+            l.sinContrato && !l.existe ? h('div', { class: 'error' }, `No se incluye: ${l.fuera}. Entra cuando esté en el contrato.`) : ''),
           h('td', {}, inp),
           h('td', { class: 'nota' }, precioManual[l.contrato] !== undefined ? 'Digitado' : (l.regla || '')));
       }))));
@@ -1961,13 +2048,13 @@ function nuevoNT(alGuardar, base = {}) {
   form.replaceChildren(encabezado,
     h('div', { class: 'form-cuerpo' },
       seccion(1, 'Producto', c.cod_auf.label, c.cum_facturar.label, c.cum.label, h('div', { class: 'ancho-total' }, avisoAuf)),
-      seccion(2, 'Datos que se llenan solos (puede corregirlos)', h('div', { class: 'ancho-doble' }, c.descripcion.label), c.cod_gen_siesa.label,
+      seccion(2, 'Datos que se llenan solos', h('div', { class: 'ancho-doble' }, c.descripcion.label), c.cod_gen_siesa.label,
         c.cod_mutual.label, c.tipo_producto.label, c.iva.label),
       seccion(3, 'Contratos y precio', h('div', { class: 'ancho-total' }, fuentes),
-        h('div', { class: 'ancho-total nt-calc' }, h('strong', {}, 'Calculadora (DOC CRIS):'), compra, '+', pct, '%', resultadoCalc,
-          h('span', { class: 'nota', style: 'width:100%' }, 'Se usa solo si no hay tarifa cápita ni precio del contrato. Tope: precio regulado.')),
+        h('div', { class: 'ancho-total nt-calc' }, h('strong', {}, 'Calculadora de precio de venta:'), 'Precio de compra', compra, '+ margen', pct, '%', resultadoCalc,
+          h('span', { class: 'nota', style: 'width:100%' }, 'Ejemplo: compra $ 10.000 + margen 20 % = precio de venta $ 12.000 (sin IVA). Se usa si no hay tarifa cápita ni precio del contrato; tope: precio regulado.')),
         h('div', { class: 'ancho-total' }, h('strong', {}, 'Líneas que se crean '),
-          h('span', { class: 'nota' }, '(CAPITA si está en el Listado Cápita; en el contrato EVENTO, siempre la línea EVENTO y la del subplán EVENTO SAS SIN AUTORIZACION si está en el Listado EVENTO SAS)'), lineasZona))),
+          h('span', { class: 'nota' }, '(solo en los contratos que ya tienen el producto: CAPITA si está en el Listado Cápita; EVENTO si el ID MUTUAL está en el Contrato Evento; EVENTO SAS si además está en el Listado EVENTO SAS)'), lineasZona))),
     err,
     h('div', { class: 'form-pie' }, h('span', { class: 'nota' }, h('span', { class: 'req' }, '* '), 'Campos obligatorios'), h('span', { class: 'espacio' }),
       apr ? h('button', { type: 'button', class: 'btn sec', onclick: () => apr.volver() }, '← Volver a aprobaciones') : '',
@@ -1982,8 +2069,13 @@ function nuevoNT(alGuardar, base = {}) {
     if (!v.cod_auf || !v.cum_facturar) { err.textContent = 'El COD AUF y el CUM a facturar son obligatorios.'; return; }
     if (!sug || (v.cod_auf && !sug.molecula)) { await consultar(); if (!sug?.molecula) { err.textContent = `El COD AUF ${v.cod_auf} no existe en COD GEN: agréguelo primero al catálogo.`; return; } }
     if (!v.cum) v.cum = v.cum_facturar;
-    const nuevas = lineas.filter((l) => !l.existe);
-    if (!nuevas.length) { err.textContent = 'El CUM a facturar ya tiene todas sus líneas en la Maestra Tarifaria.'; return; }
+    const nuevas = lineas.filter((l) => !l.existe && !l.sinContrato);
+    if (!nuevas.length) {
+      const fuera = lineas.filter((l) => !l.existe && l.sinContrato);
+      err.textContent = fuera.length ? `No se puede incluir todavía: el producto no está en el contrato (${fuera.map((l) => `${lineaNT(l.contrato)}: ${l.fuera}`).join(' · ')}).`
+        : 'El CUM a facturar ya tiene todas sus líneas en la Maestra Tarifaria.';
+      return;
+    }
     try {
       const r = await api('nt_guardar', { metodo: 'POST', datos: { ...v, id: 0, activo: true, lineas: nuevas.map((l) => ({
         contrato: l.contrato, precio_venta: l.input.value,
@@ -2071,7 +2163,12 @@ function editarNT(f, alGuardar, base = {}) {
       motivos.length ? h('section', { class: 'seccion-form' }, h('h3', {}, svgIcono('alerta'), `Observaciones de la línea (${motivos.length})`),
         h('div', { class: 'lista-val' }, ...motivos.map((m) => h('div', { class: `val-item ${m.nivel === 'ERROR' ? 'v-error' : 'v-alerta'}` },
           h('div', { class: 'val-cab' }, svgIcono(m.nivel === 'ERROR' ? 'error' : 'alerta'), h('strong', {}, m.codigo), h('span', {}, ` ${m.texto}`),
-            m.codigo === 'NT29' && f.id ? botonAprobarVarios(f, m, () => { dlg.close(); alGuardar(); }) : null))))) : null,
+            m.codigo === 'NT29' && f.id ? botonAprobarVarios(f, m, () => { dlg.close(); alGuardar(); }) : null,
+            m.codigo === 'NT31' && f.id ? h('button', { type: 'button', class: 'btn sec chico btn-aprobar-varios', title: 'Quita el registro y el estado propios de la Maestra Tarifaria en todas las líneas del CUM: quedan los de INVIMA',
+              onclick: async () => {
+                try { const r = await api('nt_tomar_invima', { metodo: 'POST', datos: { cum_facturar: f.cum_facturar } }); dlg.close(); toast(`Actualizado con INVIMA en ${r.lineas} línea(s).`); alGuardar(); }
+                catch (e) { err.textContent = e.message; }
+              } }, svgIcono('ok'), 'Actualizar con INVIMA') : null))))) : null,
       seccion(1, 'Identificación', h('label', {}, 'CUM a facturar', c.cum_facturar, avisoCf),
         h('label', {}, 'Contrato', ro(f.contrato_vista || f.contrato)),
         h('label', {}, 'Subplán', ro(f.subplan || 'Sin subplán')),
@@ -2279,7 +2376,7 @@ function panelImportarNT(abierto, alAplicar, titulo = 'Importar / actualizar des
         r.cambios.flatMap((x) => Object.entries(x.campos).map(([k, v]) => [x.cum_facturar, x.contrato, k, v.antes ?? '(vacío)', v.despues]))));
       if (r.nuevos.length && r.nuevos.length < s.filas_archivo) bloques.push(h('h3', { style: 'margin-top:8px' }, 'Nuevos'),
         tablaSimple(['CUM facturar', 'COD MUTUAL', 'Descripción', 'Precio'], r.nuevos.map((n) => [n.cum_facturar, n.cod_mutual, n.descripcion, pesos(n.precio_venta)])));
-      const avisos = [...r.repetidos.map((x) => `CUM repetido: ${x}`), ...r.omitidas];
+      const avisos = [...(r.avisos || []), ...r.repetidos.map((x) => `CUM repetido: ${x}`), ...r.omitidas];
       if (avisos.length) bloques.push(h('div', { class: 'aviso-caja', style: 'margin-top:8px' }, h('ul', { class: 'lista-avisos' }, ...avisos.map((a) => h('li', {}, a)))));
       if (r.no_en_archivo.length) bloques.push(h('details', { style: 'margin-top:8px' }, h('summary', { style: 'cursor:pointer' },
         `${r.no_en_archivo.length} productos de la Maestra Tarifaria no vienen en el archivo (no se borran; se desactivan con «Editar»)`), h('p', { class: 'nota' }, r.no_en_archivo.join(', '))));
@@ -2304,7 +2401,7 @@ function panelImportarNT(abierto, alAplicar, titulo = 'Importar / actualizar des
 }
 
 const CATS = [
-  ['molecula', 'COD GEN (moléculas)', [['cod_gen_audifarma', 'Cód. Audifarma'], ['descripcion_general', 'Descripción'], ['codigo_medicar', 'Cód. Medicar'], ['concentracion_agrupada', 'Concentración'], ['principio_activo', 'Principio activo'], ['forma_farmaceutica', 'Forma'], ['via_administracion', 'Vía'], ['cadena_frio', 'Frío'], ['clasificacion_entrega', 'Clasificación de entrega'], ['activo', 'Estado']]],
+  ['molecula', 'COD GEN (moléculas)', [['cod_gen_audifarma', 'Cód. Audifarma'], ['descripcion_general', 'Descripción'], ['codigo_medicar', 'Cód. Medicar'], ['concentracion_agrupada', 'Concentración'], ['principio_activo', 'Principio activo'], ['forma_farmaceutica', 'Forma'], ['via_administracion', 'Vía'], ['pos_no_pos', 'POS / NO POS'], ['cadena_frio', 'Frío'], ['clasificacion_entrega', 'Clasificación de entrega'], ['activo', 'Estado']]],
   ['laboratorio', 'Laboratorios', [['codigo', 'Código'], ['nombre', 'Laboratorio'], ['activo', 'Estado']]],
   ['presentacion', 'Presentaciones', [['codigo', 'Código'], ['presentacion_agrupada', 'Presentación'], ['unidad_orden', 'Unidad de orden'], ['activo', 'Estado']]],
   ['subplan', 'Subplanes Medicar', [['id_subplan', 'ID'], ['nombre', 'Subplán'], ['clasificacion', 'Clasificación'], ['fuente', 'Fuente de precio'], ['activo', 'Estado']]],
@@ -2661,9 +2758,9 @@ async function pCorrecciones(c) {
     const conFiltros = Object.keys(filtros).length > 0;
     const cuantas = conFiltros ? ' que cumplen los filtros de la tabla' : ` (${miles(n)})`;
     if (!await confirmar(`Descargar archivo${esMed ? '' : 's'} de corrección de ${sistema}`,
-      (esMed ? `Se descargan las correcciones pendientes${cuantas} en un Excel con el formato de MEDICAR: PLU y OBSERVACIÓN (una fila por PLU con todo lo que hay que corregir). `
+      (esMed ? `Se descargan las correcciones pendientes${cuantas} en un Excel: la hoja «Correcciones» con el formato de cargue de MEDICAR (PLU y OBSERVACIÓN) y la hoja «Detalle» con todas las columnas para corregir (CUM, COD AUF, descripción, subplán, campo, valor en MEDICAR y valor correcto). `
         : `Se descargan las correcciones pendientes${cuantas} en un ZIP: Descripciones Técnicas (ID MUTUAL, Cód. Audifarma, tipo y registro), `
-        + 'CREACION_ITEM (grupo impositivo), la lista para corregir a mano (estado, PLU repetidos, CUM que no están) y el detalle. ')
+        + 'CREACION_ITEM (grupo impositivo), la lista para corregir a mano (estado, PLU repetidos, CUM que no están) y el detalle con todas las columnas. ')
       + `Quedan como «Pendiente de actualización» hasta que se cargue ${esMed ? 'una Maestra MEDICAR nueva' : 'un Maestro SIESA nuevo'}: si ya coinciden pasan a «Corregido».`, 'Descargar')) return;
     try {
       const r = await api('cor_exportar', { metodo: 'POST', datos: { sistema, filtros } });
@@ -2684,7 +2781,7 @@ async function pCorrecciones(c) {
       gestionar ? h('button', { class: 'btn sec', onclick: () => descargasCorrecciones(sistema) }, svgIcono('carpeta'), 'Descargas') : null,
       gestionar ? h('button', { class: 'btn primario', disabled: !rs.exportables, onclick: () => descargar(rs.exportables),
         title: rs.exportables ? 'Descarga los archivos de cargue con lo pendiente (respeta los filtros de la tabla)' : 'No hay correcciones pendientes por descargar' },
-      svgIcono('bajar'), `${esMed ? 'Archivo PLU + observación' : 'Archivos de cargue'} (${miles(rs.exportables)})`) : null,
+      svgIcono('bajar'), `Descargar (${miles(rs.exportables)})`) : null,
     ].filter(Boolean);
     const porCampo = Object.entries(rs.campos).sort((a, b) => b[1] - a[1]);
     const menuCampos = porCampo.length ? h('details', { class: 'menu-exportar nt-reglas-menu' },
@@ -2810,6 +2907,8 @@ async function descargasCorrecciones(sistema) {
  */
 function editarMolecula(f, sug, alGuardar, pre = {}) {
   const dlg = $('#dialogo'); const form = $('#dialogo-form');
+  const propone = !puede('CATALOGO.EDITAR'); // usuario de creación: lo que guarda queda pendiente de aprobación (2026-11-17)
+  const motivoRechazo = f?.aprobacion === 'RECHAZADO' ? (sug.rechazos?.[f.cod_gen_audifarma] || 'sin motivo') : null;
   dlg.onclose = null; dlg.oncancel = null;
   const campo = (nombre, etiqueta, el, ayuda = '') => { if (nombre) el.name = nombre; return h('label', {}, etiqueta, el, ayuda ? h('span', { class: 'nota' }, ayuda) : null); };
   const txt = (v, attrs = {}) => { const e = h('input', { type: 'text', autocomplete: 'off', ...attrs }); e.value = v ?? ''; return e; };
@@ -2818,7 +2917,7 @@ function editarMolecula(f, sug, alGuardar, pre = {}) {
   const c = {
     cod_gen_audifarma: f ? null : txt(pre.cod_gen_audifarma, { required: true, placeholder: 'ej. 4039M' }),
     descripcion_general: txt(f?.descripcion_general ?? pre.descripcion_general, { required: true }),
-    codigo_medicar: f ? txt(f.codigo_medicar, { type: 'number', required: true, min: '1' }) : null,
+    codigo_medicar: f && !propone ? txt(f.codigo_medicar, { type: 'number', required: true, min: '1' }) : null,
     principio_activo: txt(f?.principio_activo, { required: true }),
     concentracion_agrupada: txt(f?.concentracion_agrupada, { required: true }),
     forma_farmaceutica: autocompletar(txt(f?.forma_farmaceutica, { required: true }), sug.forma_farmaceutica || []),
@@ -2833,24 +2932,40 @@ function editarMolecula(f, sug, alGuardar, pre = {}) {
     cantidad_tope: txt(f?.cantidad_tope, { type: 'number', min: '0' }),
   };
   const nombreDe = (k) => (c[k]?.matches?.('input, select') ? c[k] : c[k]?.querySelector?.('input')); // autocompletar envuelve el campo
+  // COD AUF (2026-11-17): se corrige solo mientras no esté en la Maestra Tarifaria, en productos creados, SIESA ni MEDICAR; luego queda cerrado
+  const codCampo = f ? ro(f.cod_gen_audifarma) : null;
+  const notaCod = f ? 'Revisando si se puede corregir…' : '';
+  if (f) {
+    api('molecula_uso', { params: { id: f.id } }).then((r) => {
+      const nota = codCampo.parentElement?.querySelector('.nota');
+      if (r.usos?.length) { if (nota) nota.textContent = `No se modifica: ${r.usos.join('; ')}.`; return; }
+      codCampo.readOnly = false; codCampo.classList.remove('solo-lectura'); codCampo.tabIndex = 0; codCampo.required = true;
+      codCampo.addEventListener('input', () => { codCampo.value = codCampo.value.toUpperCase().replace(/\s+/g, ''); });
+      if (nota) nota.textContent = 'Se puede corregir hasta que se agregue a la Maestra Tarifaria.';
+    }).catch(() => { const nota = codCampo.parentElement?.querySelector('.nota'); if (nota) nota.textContent = 'No se modifica.'; });
+  }
   let activo = f ? Number(f.activo) === 1 : true;
   const estadoTxt = h('span', { class: 'nota' }, activo ? 'Activo' : 'Inactivo: no se usa al crear productos');
   const interruptor = h('button', { type: 'button', class: `interruptor${activo ? ' on' : ''}`, role: 'switch', 'aria-checked': String(activo), 'aria-label': 'Activo',
     onclick: () => { activo = !activo; interruptor.classList.toggle('on', activo); interruptor.setAttribute('aria-checked', String(activo)); estadoTxt.textContent = activo ? 'Activo' : 'Inactivo: no se usa al crear productos'; } }, h('span', {}));
   const seccion = (n, titulo, ...hijos) => h('section', { class: 'seccion-form' }, h('h3', {}, h('span', { class: 'sec-num' }, String(n)), titulo), h('div', { class: 'rejilla-form' }, ...hijos));
   // otros COD GEN con el mismo código Medicar (no se puede repetir)
-  const repetido = f ? (sug.medicar_repetidos || []).find((x) => String(x.codigo) === String(f.codigo_medicar)) : null;
+  const repetido = f && !propone ? (sug.medicar_repetidos || []).find((x) => String(x.codigo) === String(f.codigo_medicar)) : null;
   // código repetido (pedido del usuario, 2026-11-05): se asigna solo el siguiente consecutivo libre (el mayor del catálogo y de MEDICAR + 1);
   // al guardar queda corregido. «Conservar» deja el código actual (para corregir el otro COD GEN).
   const nuevoMedicar = repetido && sug.siguiente_medicar ? String(sug.siguiente_medicar) : null;
-  if (nuevoMedicar) c.codigo_medicar.value = nuevoMedicar;
+  // (2026-11-11) si el COD GEN ya tiene productos (PLU en SIESA o líneas en la MT), su código es el prefijo de sus PLU y su molécula en
+  // MEDICAR: no se cambia solo; se puede asignar a mano con el botón, sabiendo que crea otra molécula y otro prefijo
+  const conProductos = !!repetido && (repetido.con_productos || []).map(String).includes(String(f.cod_gen_audifarma));
+  if (nuevoMedicar && !conProductos) c.codigo_medicar.value = nuevoMedicar;
   const txtRep = h('span', {}, '');
   const pintarRep = () => {
     const otros = repetido.cod_gen.filter((x) => String(x) !== String(f.cod_gen_audifarma)).join(', ');
     txtRep.textContent = !nuevoMedicar ? ` también lo tiene${repetido.cod_gen.length > 2 ? 'n' : ''} el COD GEN ${otros}: asigne a cada uno su propio código.`
       : c.codigo_medicar.value === nuevoMedicar ? ` con el COD GEN ${otros}: se asignó el siguiente consecutivo ${nuevoMedicar}. Guarde para corregirlo.`
-        : ` con el COD GEN ${otros}: se conserva ${repetido.codigo}; corrija el otro COD GEN.`;
-    btnRep.textContent = c.codigo_medicar.value === nuevoMedicar ? `Conservar ${repetido.codigo}` : `Asignar ${nuevoMedicar}`;
+        : conProductos ? ` con el COD GEN ${otros}. Este COD GEN ya tiene productos con el ${repetido.codigo}: no se cambia solo (otro código crea otra molécula en MEDICAR y otro prefijo de PLU). Si sobra, corrija el otro COD GEN.`
+          : ` con el COD GEN ${otros}: se conserva ${repetido.codigo}; corrija el otro COD GEN.`;
+    btnRep.textContent = c.codigo_medicar.value === nuevoMedicar ? `Conservar ${repetido.codigo}` : `Asignar ${nuevoMedicar}${conProductos ? ' de todas formas' : ''}`;
   };
   const btnRep = nuevoMedicar ? h('button', { type: 'button', class: 'btn sec chico', onclick: () => {
     c.codigo_medicar.value = c.codigo_medicar.value === nuevoMedicar ? String(repetido.codigo) : nuevoMedicar; pintarRep(); } }) : null;
@@ -2861,16 +2976,20 @@ function editarMolecula(f, sug, alGuardar, pre = {}) {
       h('div', { class: 'det-sub' },
         f ? h('span', { class: 'pill-codigo' }, `Cód. Medicar ${f.codigo_medicar}`) : h('span', { class: 'pill-codigo' }, `Cód. Medicar ${sug.siguiente_medicar || '—'} (automático)`),
         f ? h('span', { class: `chip-estado e-${Number(f.activo) ? 'ok' : 'gris'}` }, svgIcono(Number(f.activo) ? 'ok' : 'pendiente'), Number(f.activo) ? 'Activo' : 'Inactivo') : null,
-        h('span', { class: 'nota' }, 'Queda en auditoría. Los COD GEN no se eliminan: se inactivan.'))),
+        propone ? h('span', { class: 'chip-estado e-alerta' }, svgIcono('pendiente'), 'Queda pendiente de aprobación del Administrador')
+          : h('span', { class: 'nota' }, 'Queda en auditoría. Los COD GEN no se eliminan: se inactivan.'))),
     h('button', { type: 'button', class: 'btn-icono cerrar-x', title: 'Cerrar (Esc)', 'aria-label': 'Cerrar', onclick: () => dlg.close() }, '✕'));
   const err = h('p', { class: 'error', role: 'alert' });
   form.replaceChildren(encabezado,
     h('div', { class: 'form-cuerpo' },
+      motivoRechazo ? h('section', { class: 'seccion-form' }, h('div', { class: 'lista-val' }, h('div', { class: 'val-item v-error' },
+        h('div', { class: 'val-cab' }, svgIcono('error'), h('strong', {}, 'Rechazado por el Administrador:'), h('span', {}, ` ${motivoRechazo}. Corrija y envíe de nuevo.`))))) : null,
       repetido ? h('section', { class: 'seccion-form' }, h('div', { class: 'lista-val' }, h('div', { class: 'val-item v-error' },
         h('div', { class: 'val-cab' }, svgIcono('error'), h('strong', {}, `Código Medicar ${repetido.codigo} repetido`), txtRep, btnRep)))) : null,
       seccion(1, 'Identificación',
-        f ? campo(null, 'Código genérico Audifarma', ro(f.cod_gen_audifarma), 'No se modifica.') : campo('cod_gen_audifarma', 'Código genérico Audifarma', c.cod_gen_audifarma),
-        f ? campo('codigo_medicar', 'Código Medicar (COD_GEN_SIESA)', c.codigo_medicar, 'No se puede repetir en otro COD GEN.')
+        f ? campo('cod_gen_audifarma', 'Código genérico Audifarma', codCampo, notaCod) : campo('cod_gen_audifarma', 'Código genérico Audifarma', c.cod_gen_audifarma),
+        f && propone ? campo(null, 'Código Medicar (COD_GEN_SIESA)', ro(f.codigo_medicar), 'Lo asigna el aplicativo.')
+          : f ? campo('codigo_medicar', 'Código Medicar (COD_GEN_SIESA)', c.codigo_medicar, 'No se puede repetir en otro COD GEN.')
           : campo(null, 'Código Medicar (COD_GEN_SIESA)', ro(`${sug.siguiente_medicar || '—'} (automático)`), 'Siguiente consecutivo libre.'),
         h('div', { class: 'ancho-triple' }, campo('descripcion_general', 'Descripción genérica', c.descripcion_general))),
       seccion(2, 'Composición',
@@ -2880,21 +2999,23 @@ function editarMolecula(f, sug, alGuardar, pre = {}) {
         h('div', { class: 'ancho-doble' }, campo('pos_no_pos', 'POS / NO POS', c.pos_no_pos, 'Define el subplán de sus líneas EVENTO: EVENTO POS o EVENTO NO PBS.')),
         campo('cadena_frio', 'Cadena de frío', c.cadena_frio), campo('cantidad_tope', 'Cantidad tope', c.cantidad_tope),
         campo('clasificacion_entrega', 'Clasificación de entrega', c.clasificacion_entrega),
-        f ? h('div', { class: 'campo-interruptor ancho-total' }, interruptor, h('strong', {}, 'Activo'), estadoTxt) : null)),
+        f && !propone ? h('div', { class: 'campo-interruptor ancho-total' }, interruptor, h('strong', {}, 'Activo'), estadoTxt) : null)),
     err,
     h('div', { class: 'form-pie' }, h('span', { class: 'espacio' }),
       h('button', { class: 'btn sec', value: 'cancelar', formnovalidate: true }, 'Cancelar'),
-      h('button', { class: 'btn primario', value: 'ok' }, svgIcono('ok'), f ? 'Guardar' : 'Crear COD GEN')));
+      h('button', { class: 'btn primario', value: 'ok' }, svgIcono('ok'), propone ? 'Enviar para aprobación' : f ? 'Guardar' : 'Crear COD GEN')));
   ['forma_farmaceutica', 'via_administracion', 'grupo_farmacologico'].forEach((k) => { nombreDe(k).name = k; });
   form.onsubmit = async (ev) => {
     if (ev.submitter?.value === 'cancelar') return;
     ev.preventDefault(); err.textContent = '';
     const v = {};
     for (const k of Object.keys(c)) { const e = nombreDe(k); if (e) v[k] = e.value; }
+    if (f && !codCampo.readOnly) v.cod_gen_audifarma = codCampo.value.trim();
     try {
       const r = await api('molecula_guardar', { metodo: 'POST', datos: { ...v, id: f?.id, activo } });
       dlg.close();
-      toast(r.aviso || 'COD GEN guardado. La Maestra Tarifaria se recalcula con el cambio.', !!r.aviso);
+      toast(propone ? `COD GEN ${r.registro?.cod_gen_audifarma ?? ''} enviado: queda pendiente de aprobación del Administrador.`
+        : r.aviso || 'COD GEN guardado. La Maestra Tarifaria se recalcula con el cambio.', !propone && !!r.aviso);
       alGuardar();
     } catch (e) { err.textContent = e.message; }
   };
@@ -2913,7 +3034,9 @@ function editarMolecula(f, sug, alGuardar, pre = {}) {
 
 async function pCatalogos(c) {
   const editable = puede('CATALOGO.EDITAR');
-  const sug = editable ? await api('catalogo_sugerencias') : null;
+  // usuario de creación (2026-11-17): crea COD GEN en el catálogo; queda pendiente de aprobación del Administrador
+  const proponer = !editable && puede('PRODUCTO.CREAR');
+  const sug = editable || proponer ? await api('catalogo_sugerencias') : null;
   let listas = (await api('listas')).listas;
   const sel = h('select');
   const armarSelector = (valor) => {
@@ -2955,7 +3078,8 @@ async function pCatalogos(c) {
     const [k, , cols, cfg = {}] = CATS.find(([x]) => x === sel.value);
     const columnas = cols.map(([campo, titulo]) => ({
       campo, titulo,
-      valor: ['activo', 'habilitado'].includes(campo) ? (f) => (Number(f[campo]) ? chip('Activo', 'ok') : chip('Inactivo', 'gris')) : null,
+      valor: ['activo', 'habilitado'].includes(campo) ? (f) => (f.aprobacion === 'PENDIENTE' ? chip('Pendiente de aprobación', 'alerta')
+        : f.aprobacion === 'RECHAZADO' ? chip('Rechazado', 'error') : Number(f[campo]) ? chip('Activo', 'ok') : chip('Inactivo', 'gris')) : null,
     }));
     if (editable && EDITORES[k]) {
       // Al guardar se recalculan los códigos Medicar repetidos (aviso y filtro «Ver los N en la tabla»), pedido del usuario 2026-11-05:
@@ -3005,10 +3129,23 @@ async function pCatalogos(c) {
       zona.append(h('div', { class: 'cat-nuevo' },
         h('button', { class: 'btn primario', onclick: () => EDITORES[k](null, sug, refrescarSug) }, svgIcono('mas'), 'Nuevo'),
         h('span', { class: 'nota' }, svgIcono('pendiente'), 'Solo el Administrador crea y edita. Los cambios quedan en auditoría; los registros se desactivan, no se eliminan.')));
+    } else if (proponer && k === 'molecula') {
+      const refrescar = async () => { Object.assign(sug, await api('catalogo_sugerencias')); t.refrescar(); };
+      // solo los que esperan aprobación o fueron rechazados: se corrigen y se reenvían
+      columnas.push({ titulo: 'Acciones', filtro: false, valor: (f) => (['PENDIENTE', 'RECHAZADO'].includes(f.aprobacion)
+        ? h('button', { type: 'button', class: 'btn-icono', title: f.aprobacion === 'RECHAZADO' ? 'Corregir y reenviar' : 'Corregir', 'aria-label': 'Corregir', onclick: () => editarMolecula(f, sug, refrescar) }, svgIcono('editar')) : '') });
+      zona.append(h('div', { class: 'cat-nuevo' },
+        h('button', { class: 'btn primario', onclick: () => editarMolecula(null, sug, refrescar) }, svgIcono('mas'), 'Nuevo COD GEN'),
+        h('span', { class: 'nota' }, svgIcono('pendiente'), 'Lo que cree queda «Pendiente de aprobación» del Administrador; los productos que lo usan esperan esa aprobación para crearse. Puede corregir los pendientes y los rechazados.')));
     }
     // tabla tipo Excel: letra pequeña, una línea por fila; el texto largo se ve completo al pasar el mouse
     const t = tablaPaginada({ contenedor: zona, columnas, clase: 'tabla-excel tabla-datos tabla-cat', cargar: (p) =>
-      api('catalogo', { params: { tipo: cfg.tipo || k, ...(cfg.params || {}), ...p } }) });
+      api('catalogo', { params: { tipo: cfg.tipo || k, ...(cfg.params || {}), ...p } }),
+      descargar: (filtros) => {
+        const q = new URLSearchParams({ accion: 'catalogo', tipo: cfg.tipo || k, ...(cfg.params || {}), exportar: '1', filtros: JSON.stringify(filtros),
+          columnas: JSON.stringify(cols), titulo: CATS.find(([x]) => x === k)[1] });
+        window.location.href = `api.php?${q}`;
+      } });
     zona.onmouseover = (ev) => { const td = ev.target.closest?.('.tabla-datos td'); if (td && !td.title && td.scrollWidth > td.clientWidth) td.title = td.textContent; };
   };
   sel.addEventListener('change', pintar);

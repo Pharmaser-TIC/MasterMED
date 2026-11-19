@@ -127,12 +127,19 @@ function enviar_archivo(string $ruta, string $nombre, bool $temporal = false): n
     $tipos = ['xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'csv' => 'text/csv', 'xlsm' => 'application/vnd.ms-excel.sheet.macroEnabled.12'];
     header_remove('Content-Type');
     header('Content-Type: ' . ($tipos[strtolower(pathinfo($nombre, PATHINFO_EXTENSION))] ?? 'application/octet-stream'));
-    header('Content-Disposition: attachment; filename="' . str_replace('"', '', $nombre) . '"');
+    // nombre con tildes (p.ej. «moléculas»): filename* en UTF-8; filename simple de respaldo sin tildes
+    $simple = str_replace('"', '', (string) (iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $nombre) ?: $nombre));
+    header('Content-Disposition: attachment; filename="' . $simple . '"; filename*=UTF-8' . "''" . rawurlencode($nombre));
     header('Content-Length: ' . filesize($ruta));
     readfile($ruta);
     if ($temporal) @unlink($ruta);
     exit;
 }
+
+/** Columnas filtrables de la tabla de Inconsistencias (pantalla y Excel de la tabla). */
+const COR_COLS_TABLA = ['estado' => 'estado', 'plu' => 'plu', 'item' => 'item', 'cum_facturar' => 'cum_facturar', 'contratos' => 'contratos', 'subplan' => 'subplan', 'campo' => 'campo',
+    'valor_actual' => 'valor_actual', 'valor_esperado' => 'valor_esperado', 'accion' => 'accion', 'cargue' => 'cargue',
+    'detectado_en' => 'detectado_en', 'exportado_en' => 'exportado_en', 'cerrado_en' => 'cerrado_en'];
 
 function filtros_sql(array $permitidos, array $exactos = [], ?string $excluir = null): array {
     $filtros = json_decode((string) ($_GET['filtros'] ?? '{}'), true);
@@ -213,9 +220,9 @@ const PERMISOS_SOLO_ADMIN = ['BASE.ACTUALIZAR', 'CATALOGO.EDITAR', 'USUARIO.GEST
 
 // ------------------------------------------------------------------ catálogos consultables
 const CATALOGOS = [
-    'molecula'     => ['cat_molecula', 'id, cod_gen_audifarma, descripcion_general, codigo_medicar, concentracion_agrupada, principio_activo, forma_farmaceutica, grupo_farmacologico, via_administracion, pos_no_pos, cadena_frio, clasificacion_entrega, cantidad_tope, activo', ['cod_gen_audifarma', 'descripcion_general', 'codigo_medicar', 'principio_activo'], 'cod_gen_audifarma'],
-    'laboratorio'  => ['cat_laboratorio', 'id, codigo, nombre, activo', ['codigo', 'nombre'], 'nombre'],
-    'presentacion' => ['cat_presentacion', 'id, codigo, presentacion_agrupada, unidad_orden, activo', ['codigo', 'presentacion_agrupada', 'unidad_orden'], 'presentacion_agrupada'],
+    'molecula'     => ['cat_molecula', 'id, cod_gen_audifarma, descripcion_general, codigo_medicar, concentracion_agrupada, principio_activo, forma_farmaceutica, grupo_farmacologico, via_administracion, pos_no_pos, cadena_frio, clasificacion_entrega, cantidad_tope, activo, aprobacion', ['cod_gen_audifarma', 'descripcion_general', 'codigo_medicar', 'principio_activo'], 'cod_gen_audifarma'],
+    'laboratorio'  => ['cat_laboratorio', 'id, codigo, nombre, activo, aprobacion', ['codigo', 'nombre'], 'nombre'],
+    'presentacion' => ['cat_presentacion', 'id, codigo, presentacion_agrupada, unidad_orden, activo, aprobacion', ['codigo', 'presentacion_agrupada', 'unidad_orden'], 'presentacion_agrupada'],
     'lista'        => ['cat_lista_valor', 'id, lista, valor, orden, activo', ['valor'], 'orden, valor'],
     'subplan'      => ['cat_subplan', 'id_subplan, nombre, clasificacion, fuente, activo, actualizado_en', ['nombre'], 'id_subplan'],
     'grupo_imp'    => ['cat_grupo_impositivo', 'codigo, etiqueta_iva, descripcion, iva_medicar, activo', ['codigo', 'descripcion'], 'codigo'],
@@ -484,6 +491,11 @@ $acciones = [
         readfile($ruta);
         exit;
     }],
+    'nt_tomar_invima' => ['POST', function () {
+        $u = requerir_permiso('NT.GESTIONAR');
+        $in = entrada();
+        return ['lineas' => transaccion(fn() => nt_tomar_invima(db(), (string) ($in['cum_facturar'] ?? ''), $u['id']))];
+    }],
     'nt_validar_cum' => ['POST', function () {
         $u = requerir_permiso('NT.GESTIONAR');
         $in = entrada();
@@ -544,6 +556,15 @@ $acciones = [
         transaccion(fn() => sol_item_eliminar(db(), (int) ($in['lote_id'] ?? 0), (int) ($in['id'] ?? 0), $u['id']));
         return ['ok' => true];
     }],
+    'sol_items_eliminar' => ['POST', function () {
+        // lista de chequeo (2026-11-17): quitar varios productos de la solicitud de una vez
+        $u = requerir_permiso('PRODUCTO.CREAR');
+        $in = entrada();
+        $ids = array_values(array_unique(array_filter(array_map('intval', (array) ($in['ids'] ?? [])))));
+        if (!$ids) throw new ErrorApi('Marque al menos un producto.', 422);
+        transaccion(function () use ($in, $ids, $u) { foreach ($ids as $i) sol_item_eliminar(db(), (int) ($in['lote_id'] ?? 0), $i, $u['id']); });
+        return ['quitados' => count($ids)];
+    }],
     'sol_validar' => ['POST', function () {
         $u = requerir_permiso('PRODUCTO.CREAR');
         return ['resumen' => transaccion(fn() => sol_validar(db(), (int) (entrada()['id'] ?? 0), $u['id']))];
@@ -602,24 +623,6 @@ $acciones = [
         $u = requerir_permiso('NT.GESTIONAR');
         return ['lineas' => nt_repetir_lineas(db(), $u['id'])];
     }],
-    'nt_por_agregar' => ['GET', function () {
-        requerir_permiso('NT.CONSULTAR');
-        $filas = array_map(fn($f) => $f + ['contrato_vista' => nt_contrato_vista($f['contrato']), 'subplan' => nt_subplan_vista($f['contrato'])], nt_por_agregar(db()));
-        return ['filas' => $filas, 'columnas' => nt_columnas_por_agregar()];
-    }],
-    'nt_por_agregar_plantilla' => ['GET', function () {
-        $u = requerir_permiso('NT.GESTIONAR');
-        $tmp = tempnam(sys_get_temp_dir(), 'nt');
-        $nombre = nt_por_agregar_plantilla(db(), $tmp);
-        auditar($u['id'], 'NT_PLANTILLA_AGREGAR', 'nt_item', null, null, ['archivo' => $nombre, 'filas' => count(nt_por_agregar(db()))]);
-        header_remove('Content-Type');
-        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        header('Content-Disposition: attachment; filename="' . $nombre . '"');
-        header('Content-Length: ' . filesize($tmp));
-        readfile($tmp);
-        unlink($tmp);
-        exit;
-    }],
     'nt_activar_masivo' => ['POST', function () {
         $u = requerir_permiso('NT.GESTIONAR');
         $in = entrada();
@@ -632,7 +635,9 @@ $acciones = [
         return transaccion(fn() => nt_guardar(db(), entrada(), $u['id']));
     }],
     'nt_sugerencia' => ['GET', function () {
-        requerir_permiso('NT.GESTIONAR');
+        // también el usuario de creación: propone el precio de las líneas nuevas de la Maestra Tarifaria (2026-11-11)
+        $u = requerir_login();
+        if (!array_intersect(['NT.GESTIONAR', 'PRODUCTO.CREAR'], permisos_de((int) $u['id']))) throw new ErrorApi('No tiene permiso para esta acción (NT.GESTIONAR).', 403);
         return nt_sugerencia(db(), (string) ($_GET['cod_auf'] ?? ''), (string) ($_GET['cum_facturar'] ?? ''), (string) ($_GET['cod_mutual'] ?? ''));
     }],
     'nt_importar' => ['POST', function () {
@@ -662,9 +667,22 @@ $acciones = [
     }],
 
     // ---------------------------------------------------------------- edición de catálogos (solo Administrador)
+    // ¿se puede corregir el COD AUF? (2026-11-17): solo mientras no esté en la Maestra Tarifaria, en productos creados, SIESA ni MEDICAR
+    'molecula_uso' => ['GET', function () {
+        $u = requerir_login();
+        if (!array_intersect(['CATALOGO.EDITAR', 'PRODUCTO.CREAR'], permisos_de((int) $u['id']))) throw new ErrorApi('No tiene permiso para esta acción.', 403);
+        $st = db()->prepare('SELECT cod_gen_audifarma, codigo_medicar FROM cat_molecula WHERE id = ?');
+        $st->execute([(int) ($_GET['id'] ?? 0)]);
+        $m = $st->fetch();
+        if (!$m) throw new ErrorApi('El COD GEN no existe.', 404);
+        return ['usos' => molecula_en_uso(db(), (string) $m['cod_gen_audifarma'], (string) $m['codigo_medicar'])];
+    }],
     'catalogo_sugerencias' => ['GET', function () {
-        requerir_permiso('CATALOGO.EDITAR');
+        // también el usuario de creación: crea COD GEN en el catálogo (2026-11-17)
+        $u = requerir_login();
+        if (!array_intersect(['CATALOGO.EDITAR', 'PRODUCTO.CREAR'], permisos_de((int) $u['id']))) throw new ErrorApi('No tiene permiso para esta acción (CATALOGO.EDITAR).', 403);
         return molecula_sugerencias(db()) + [
+            'rechazos' => molecula_rechazos(db()),
             'siguiente_laboratorio' => siguiente_codigo(db(), 'laboratorio'),
             'siguiente_presentacion' => siguiente_codigo(db(), 'presentacion'),
             'siguiente_medicar' => siguiente_codigo_medicar(db()),
@@ -717,7 +735,13 @@ $acciones = [
         return catalogo_procesar_excel(db(), (string) ($_POST['tipo'] ?? ''), $a['tmp_name'], basename((string) $a['name']), $u['id'], ($_POST['modo'] ?? '') === 'aplicar');
     }],
     'molecula_guardar' => ['POST', function () {
-        $u = requerir_permiso('CATALOGO.EDITAR');
+        $u = requerir_login();
+        $permisos = permisos_de((int) $u['id']);
+        if (!in_array('CATALOGO.EDITAR', $permisos, true)) {
+            // usuario de creación (2026-11-17): crea o corrige COD GEN pendientes; el Administrador aprueba
+            if (!in_array('PRODUCTO.CREAR', $permisos, true)) throw new ErrorApi('No tiene permiso para esta acción (CATALOGO.EDITAR).', 403);
+            return transaccion(fn() => molecula_proponer(db(), entrada(), (int) $u['id']));
+        }
         $r = transaccion(fn() => molecula_guardar(db(), entrada(), $u['id']));
         cor_revisar_tras_cargue('MAESTRO_SIESA', $u['id']); // POS / NO POS y COD AUF cambian lo esperado en SIESA y MEDICAR
         return $r;
@@ -725,7 +749,7 @@ $acciones = [
 
     // ---------------------------------------------------------------- catálogos (consulta paginada en servidor)
     'catalogo' => ['GET', function () {
-        requerir_login();
+        $u = requerir_login();
         $tipo = $_GET['tipo'] ?? '';
         if (!isset(CATALOGOS[$tipo])) throw new ErrorApi('Catálogo no válido.', 404);
         [$tabla, $cols, $buscables, $orden] = CATALOGOS[$tipo];
@@ -745,6 +769,27 @@ $acciones = [
         }
         if ($campo !== null) return valores_columna($tabla, $campo, $cond, $params);
         $where = $cond ? 'WHERE ' . implode(' AND ', $cond) : '';
+        // descargar la tabla como se ve (pedido del usuario, 2026-11-17): mismas columnas y filtros, todas las páginas
+        if (!empty($_GET['exportar'])) {
+            $pedidas = array_values(array_filter((array) json_decode((string) ($_GET['columnas'] ?? '[]'), true),
+                fn($c) => is_array($c) && in_array($c[0] ?? null, $columnas, true)));
+            if (!$pedidas) throw new ErrorApi('No hay columnas para descargar.', 422);
+            $st = db()->prepare("SELECT $cols FROM $tabla $where ORDER BY $orden");
+            $st->execute($params);
+            $filas = [];
+            foreach ($st as $f) {
+                $filas[] = array_map(function ($c) use ($f) {
+                    if (!in_array($c[0], ['activo', 'habilitado'], true)) return $f[$c[0]];
+                    $ap = $f['aprobacion'] ?? null;
+                    return $ap === 'PENDIENTE' ? 'Pendiente de aprobación' : ($ap === 'RECHAZADO' ? 'Rechazado' : ((int) $f[$c[0]] ? 'Activo' : 'Inactivo'));
+                }, $pedidas);
+            }
+            $titulo = trim(preg_replace('/[^\p{L}\p{N} ()\-]/u', '', (string) ($_GET['titulo'] ?? $tipo))) ?: $tipo;
+            $tmp = tempnam(sys_get_temp_dir(), 'cat');
+            XlsxWriter::guardar($tmp, [['nombre' => mb_substr($titulo, 0, 31), 'encabezados' => array_map(fn($c) => mb_substr((string) ($c[1] ?? $c[0]), 0, 80), $pedidas), 'filas' => $filas]]);
+            auditar($u['id'], 'CATALOGO_EXPORTAR', $tabla, $tipo, null, ['filtros' => json_decode((string) ($_GET['filtros'] ?? '{}'), true), 'filas' => count($filas)]);
+            enviar_archivo($tmp, 'CATALOGO ' . $titulo . ' ' . date('Ymd_His') . '.xlsx', true);
+        }
         $st = db()->prepare("SELECT COUNT(*) FROM $tabla $where");
         $st->execute($params);
         $total = (int) $st->fetchColumn();
@@ -951,9 +996,7 @@ $acciones = [
     'cor_listar' => ['GET', function () {
         $u = requerir_permiso('CORRECCION.CONSULTAR');
         $sistema = cor_sistema();
-        $cols = ['estado' => 'estado', 'plu' => 'plu', 'item' => 'item', 'cum_facturar' => 'cum_facturar', 'contratos' => 'contratos', 'subplan' => 'subplan', 'campo' => 'campo',
-            'valor_actual' => 'valor_actual', 'valor_esperado' => 'valor_esperado', 'accion' => 'accion', 'cargue' => 'cargue',
-            'detectado_en' => 'detectado_en', 'exportado_en' => 'exportado_en', 'cerrado_en' => 'cerrado_en'];
+        $cols = COR_COLS_TABLA;
         $campo = $_GET['valores_de'] ?? null;
         if ($campo !== null && !isset($cols[$campo])) throw new ErrorApi('Columna no válida.', 422);
         [$cond, $params] = filtros_sql($cols, [], $campo);
@@ -1070,7 +1113,7 @@ try {
     if ($metodo === 'POST') verificar_csrf();
     // Foto diaria de la Maestra Tarifaria antes del primer cambio del día (ver nt_foto_del_dia)
     // (solo si el usuario puede cambiarla; las aprobaciones también crean líneas en la Maestra Tarifaria)
-    if ($metodo === 'POST' && in_array($nombre, ['nt_quitar_medicar', 'nt_validar_cum', 'nt_precio_uno_aprobar', 'nt_repetir_lineas', 'nt_guardar', 'nt_importar', 'nt_activar_masivo', 'sol_resolver'], true)
+    if ($metodo === 'POST' && in_array($nombre, ['nt_quitar_medicar', 'nt_tomar_invima', 'nt_validar_cum', 'nt_precio_uno_aprobar', 'nt_repetir_lineas', 'nt_guardar', 'nt_importar', 'nt_activar_masivo', 'sol_resolver'], true)
         && ($ua = usuario_actual()) && array_intersect(['NT.GESTIONAR', 'CATALOGO.EDITAR'], permisos_de((int) $ua['id']))) {
         try { nt_foto_del_dia(db(), (int) $ua['id']); } catch (Throwable $e) { error_log('[nt_foto_del_dia] ' . $e); }
     }
