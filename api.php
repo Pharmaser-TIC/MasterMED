@@ -808,7 +808,8 @@ $acciones = [
         $antes = $st->fetch() ?: null;
         // Fase 7D: clasificación del contrato (CAPITA / EVENTO) y fuente de precio del subplán
         $clas = strtoupper(trim((string) ($in['clasificacion'] ?? '')));
-        if ($clas !== '' && !in_array($clas, ['CAPITA', 'EVENTO'], true)) throw new ErrorApi('La clasificación debe ser CAPITA o EVENTO.', 422);
+        // VALIDACION: subplán que no es de la Maestra Tarifaria, solo criterio de Inconsistencias MEDICAR (TRANSFERENCIA DE PENDIENTES, 2026-11-20)
+        if ($clas !== '' && !in_array($clas, ['CAPITA', 'EVENTO', 'VALIDACION'], true)) throw new ErrorApi('La clasificación debe ser CAPITA, EVENTO o Solo validación MEDICAR.', 422);
         $fuente = strtoupper(trim((string) ($in['fuente'] ?? '')));
         if ($fuente !== '' && !in_array($fuente, SUBPLAN_FUENTES, true)) throw new ErrorApi('Fuente de precio no válida.', 422);
         if ($antes) {

@@ -356,22 +356,24 @@ function sol_autocompletar(PDO $pdo, string $codAuf, string $cum): array {
 
 /**
  * Subplanes que tendrá el producto (para mostrarlos en el formulario antes de guardar). Misma regla de la validación
- * (E15): Listado Cápita → CAPITA PBS; Listado EVENTO SAS → EVENTO SAS SIN AUTORIZACION; Contrato Evento → EVENTO POS
- * (EVENTO NO PBS si el COD GEN es NO POS). Cada uno indica si se puede crear (EVENTO exige estar en el contrato).
+ * (E15), con las combinaciones de subplanes (2026-11-20): POS → Listado Cápita → CAPITA PBS; Listado EVENTO SAS → EVENTO SAS SIN
+ * AUTORIZACION; Contrato Evento → EVENTO POS solo si no va por ninguno de los dos listados. NO POS → solo EVENTO NO PBS.
+ * Cada uno indica si se puede crear (EVENTO exige estar en el contrato).
  */
 function sol_subplanes_previstos(PDO $pdo, string $e, string $c, ?string $posNoPos): array {
     if ($e === '' && $c === '') return [];
     $q = function (string $sql, array $p) use ($pdo) { $st = $pdo->prepare($sql); $st->execute($p); return $st->fetchColumn(); };
     $out = [];
-    if ($e !== '' && $q('SELECT 1 FROM ref_capita WHERE carga_id = ? AND UPPER(codigo_cup) = ? ORDER BY id', [_carga_vigente($pdo, 'LISTADO_CAPITA'), $e]))
+    $noPos = _u($posNoPos) === 'NO POS';
+    if (!$noPos && $e !== '' && $q('SELECT 1 FROM ref_capita WHERE carga_id = ? AND UPPER(codigo_cup) = ? ORDER BY id', [_carga_vigente($pdo, 'LISTADO_CAPITA'), $e]))
         $out[] = ['subplan' => 'CAPITA PBS', 'fuente' => 'Listado Cápita', 'ok' => true, 'nota' => null];
-    if ($q("SELECT 1 FROM ref_evento_sas WHERE carga_id = ? AND ((cum IS NOT NULL AND cum <> '' AND UPPER(cum) = ?) OR ((cum IS NULL OR cum = '') AND UPPER(cod_audifarma) = ?))", [_carga_vigente($pdo, 'LISTADO_EVENTO_SAS'), $c, $e]))
+    if (!$noPos && $q("SELECT 1 FROM ref_evento_sas WHERE carga_id = ? AND ((cum IS NOT NULL AND cum <> '' AND UPPER(cum) = ?) OR ((cum IS NULL OR cum = '') AND UPPER(cod_audifarma) = ?))", [_carga_vigente($pdo, 'LISTADO_EVENTO_SAS'), $c, $e]))
         $out[] = ['subplan' => 'EVENTO SAS SIN AUTORIZACION', 'fuente' => 'Listado EVENTO SAS', 'ok' => true, 'nota' => null];
     $mutual = $c !== '' ? $q("SELECT cod_mutual FROM nt_item WHERE activo = 1 AND contrato = 'EVENTO' AND UPPER(cum_facturar) = ?", [$c]) : false;
     $evento = _u($posNoPos) === 'NO POS' ? 'EVENTO NO PBS' : 'EVENTO POS';
     if ($mutual !== false && $mutual !== null) {
         $enContrato = (bool) $q('SELECT 1 FROM ref_contrato_evento WHERE carga_id = ? AND UPPER(id_mutual) = ? ORDER BY id', [_carga_vigente($pdo, 'CONTRATO_EVENTO_22382'), _u($mutual)]);
-        if ($enContrato || !$out) $out[] = ['subplan' => $evento, 'fuente' => 'Contrato Evento', 'ok' => $enContrato,
+        if (!$out) $out[] = ['subplan' => $evento, 'fuente' => 'Contrato Evento', 'ok' => $enContrato,
             'nota' => $enContrato ? null : "El ID MUTUAL $mutual no está en el Contrato Evento: no se crea hasta que lo incluyan"];
     } elseif (!$out && $c !== '') {
         $out[] = ['subplan' => $evento, 'fuente' => 'Contrato Evento', 'ok' => false, 'nota' => 'El CUM no está en la Maestra Tarifaria: se envía solicitud al Administrador para incluirlo'];
@@ -553,9 +555,12 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
         // EVENTO POS (EVENTO NO PBS si el COD GEN es NO POS). Si está en varias listas, va en todos esos subplanes.
         // Cada subplán se valida con su línea de la Maestra Tarifaria (P5-1) y lleva su precio.
         $lineaEvento = $c !== '' ? ($nt["$c|EVENTO"] ?? null) : null;
+        // Combinaciones de subplanes (decisión del usuario, 2026-11-20): POS → CAPITA PBS y/o EVENTO SAS SIN AUTORIZACION por sus listados, y
+        // EVENTO POS solo si no va por ninguno de los dos; NO POS → solo EVENTO NO PBS (TRANSFERENCIA DE PENDIENTES se valida en Inconsistencias).
+        $noPosM = $m && _u($m['pos_no_pos']) === 'NO POS';
         $asignados = []; // subplán => contrato de la Maestra Tarifaria
-        if (isset($capita[$e])) $asignados['CAPITA PBS'] = 'CAPITA';
-        if (isset($sasCum[$c]) || isset($sasCod[$e])) $asignados['EVENTO SAS SIN AUTORIZACION'] = 'EVENTO SAS';
+        if (!$noPosM && isset($capita[$e])) $asignados['CAPITA PBS'] = 'CAPITA';
+        if (!$noPosM && (isset($sasCum[$c]) || isset($sasCod[$e]))) $asignados['EVENTO SAS SIN AUTORIZACION'] = 'EVENTO SAS';
         // EVENTO: se asigna si está en el contrato. Si no está en ninguna otra lista, el subplán EVENTO se muestra igual
         // (es el que le corresponde) y E10 lo deja en error hasta que lo incluyan en el contrato (no se crea).
         // ID MUTUAL: CUM → Maestra Mutual → Maestra Tarifaria por COD AUF; también dice en qué contratos está el producto (2026-11-11).
@@ -563,11 +568,15 @@ function sol_validar(PDO $pdo, int $loteId, int $usuarioId): array {
         $propNt = $propuesta['nt'] ?? null;
         $sug = $c !== '' && $e !== '' ? nt_sugerencia($pdo, $e, $c, (string) ($propNt['cod_mutual'] ?? '')) : null;
         $enCtrEvento = $lineaEvento ? $lineaEvento['en_contrato'] === 'SI' : !empty($sug['contrato_evento']);
-        if ($enCtrEvento || ($lineaEvento && !$asignados)) $asignados[$m && _u($m['pos_no_pos']) === 'NO POS' ? 'EVENTO NO PBS' : 'EVENTO POS'] = 'EVENTO';
+        if (!$asignados && ($enCtrEvento || $lineaEvento)) $asignados[$m && _u($m['pos_no_pos']) === 'NO POS' ? 'EVENTO NO PBS' : 'EVENTO POS'] = 'EVENTO';
         // en ninguna lista y sin línea EVENTO en la Maestra Tarifaria: se muestra el subplán EVENTO que le corresponde; abajo, E10 y la
         // solicitud al Administrador para incluirlo en la Maestra Tarifaria (no se crea hasta tener la línea)
         if (!$asignados && $c !== '') $asignados[$m && _u($m['pos_no_pos']) === 'NO POS' ? 'EVENTO NO PBS' : 'EVENTO POS'] = 'EVENTO';
         $subplanes = array_keys($asignados);
+        // TRANSFERENCIA DE PENDIENTES (decisión del usuario, 2026-11-20): no es línea de la Maestra Tarifaria, pero el archivo de MEDICAR la crea
+        // de una vez para los POS que están en el Contrato Evento (lo que Inconsistencias MEDICAR exige); los NO POS no van allí.
+        $spTransf = array_values(array_filter(array_keys($subplan), fn($n) => str_starts_with((string) $n, 'TRANSFERENCIA DE PENDIENTES')))[0] ?? 'TRANSFERENCIA DE PENDIENTES CON AUTORIZACION';
+        if (!$noPosM && $enCtrEvento && $subplanes) $subplanes[] = $spTransf;
         foreach ($subplanes as $sp) if (!isset($subplan[$sp]) || !(int) $subplan[$sp]['activo']) $add('E15', 'ERROR', 'CONTRATO MEDICAR (SUB PLAN)', $sp, 'Subplán activo con ID');
         $lineas = []; // subplán => datos de su línea de la Maestra Tarifaria
         foreach ($asignados as $sp => $k) {

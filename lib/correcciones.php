@@ -187,6 +187,7 @@ const COR_CAMPOS_MEDICAR = [
     'SUBPLAN'   => ['PLU sin el subplán de la línea', 'OBSERVACION', null],
     'TRANSFERENCIA' => ['Falta en TRANSFERENCIA DE PENDIENTES', 'OBSERVACION', null],
     'TRANSF_NO_PBS' => ['NO PBS activo en TRANSFERENCIA DE PENDIENTES', 'OBSERVACION', null],
+    'SUBPLAN_SOBRA' => ['Activo en un subplán que no le corresponde', 'OBSERVACION', null],
     'ESTADO'    => ['Estado (Opción Cadena)', 'OBSERVACION', null],
     'IVA'       => ['%Iva', 'OBSERVACION', null],
     'PRECIO'    => ['Precio Unidad Mínima con IVA', 'OBSERVACION', null],
@@ -243,15 +244,26 @@ function cor_calcular_medicar(PDO $pdo): array {
     $variosAprobados = nt_plu_varios_aprobados($pdo); // CUM aprobados con varios PLU activos
     $out = [];
     $lineas = nt_calcular($pdo)['filas'];
-    // PLU que alguna línea EVENTO POS del Contrato Evento necesita en TRANSFERENCIA: a esos no se les pide inactivarlo (2026-11-17)
-    $plusTransfPos = [];
+    // Combinaciones de subplanes (decisión del usuario, 2026-11-20). TRANSFERENCIA DE PENDIENTES no es subplán de la Maestra Tarifaria:
+    // es un criterio de validación. La llevan los POS que están en el Contrato Evento (línea CAPITA, EVENTO SAS o EVENTO POS); los NO POS no.
+    // La línea con NT32 (subplán que no le corresponde) se trata como inactiva: se pide inactivarla en MEDICAR, no crearla.
+    $nt32 = fn(array $l) => in_array('NT32', array_column($l['motivos'] ?? [], 'codigo'), true);
+    $llevaTransf = fn(array $l) => !empty($l['_en_ctr_evento']) && empty($l['_no_pos']);
+    // PLU con su línea activa: subplanes que le corresponden en MEDICAR (el de cada línea + TRANSFERENCIA si aplica)
+    $plusTransfPos = []; $esperado = []; $deLinea = [];
     foreach ($lineas as $l) {
-        if ($l['contrato'] === 'EVENTO' && $l['en_contrato'] === 'SI' && _u($l['subplan'] ?? '') !== 'EVENTO NO PBS')
-            foreach (array_keys($l['_plus_mt'] ?? []) as $p) $plusTransfPos[_u((string) $p)] = true;
+        if (!(int) $l['activo'] || $nt32($l)) continue;
+        foreach ($l['_plus_mt'] ?? [] as $p => $act) {
+            if ($act !== 1) continue;
+            $p = _u((string) $p);
+            $deLinea[$p] ??= $l;
+            if ($l['subplan'] ?? null) $esperado[$p][_u($l['subplan'])] = true;
+            if ($llevaTransf($l)) { $plusTransfPos[$p] = true; $esperado[$p][COR_SUBPLAN_TRANSFERENCIA] = true; }
+        }
     }
     foreach ($lineas as $l) {
         $cf = (string) $l['cum_facturar']; $cum = _u($cf);
-        $activoLinea = (int) $l['activo'] === 1;
+        $activoLinea = (int) $l['activo'] === 1 && !$nt32($l);
         $activo = $activoLinea;
         $sp = (string) ($l['subplan'] ?? '');
         $contrato = (string) $l['contrato_vista'];
@@ -285,23 +297,14 @@ function cor_calcular_medicar(PDO $pdo): array {
             $activo = $activoLinea && (!$mt || ($mt[$p] ?? 0) === 1); // estado del PLU en la Maestra Tarifaria (PLU + CONTRATO)
             $filas = $medPlu[$p] ?? null;
             if (!$filas) { if ($activo) $add('PLU', $p, null, $p, "Crear en MEDICAR el PLU $p (CUM $cf) en el subplán $sp"); continue; }
-            // todo lo que está en el Contrato Evento debe estar activo en MEDICAR en TRANSFERENCIA DE PENDIENTES (decisión del usuario, 2026-10-19),
-            // salvo lo NO PBS: va solo en EVENTO NO PBS, no en TRANSFERENCIA (decisión del usuario, 2026-11-17)
-            if ($activo && $l['contrato'] === 'EVENTO' && $l['en_contrato'] === 'SI' && !$variosSiesa && _u($sp) !== 'EVENTO NO PBS') {
+            // todo lo POS que está en el Contrato Evento debe estar activo en MEDICAR en TRANSFERENCIA DE PENDIENTES (2026-10-19), sea su línea
+            // CAPITA, EVENTO SAS o EVENTO POS (combinaciones, 2026-11-20); lo NO PBS no: va solo en EVENTO NO PBS (2026-11-17)
+            if ($activo && $llevaTransf($l) && !$variosSiesa) {
                 $tr = $filas[COR_SUBPLAN_TRANSFERENCIA] ?? null;
                 if (!$tr || trim((string) $tr['opcion']) !== '1') {
                     $out["MEDICAR|$cf|$p|" . COR_SUBPLAN_TRANSFERENCIA . '|TRANSFERENCIA'] = ['cum_facturar' => $cf, 'plu' => $p, 'item' => null, 'contratos' => $contrato,
                         'subplan' => COR_SUBPLAN_TRANSFERENCIA, 'campo' => 'TRANSFERENCIA', 'actual' => $tr ? 'Inactivo (9)' : 'No está', 'esperado' => 'Activo (1)', 'revision' => false,
                         'accion' => ($tr ? 'Activar' : 'Crear') . " el PLU $p en el subplán " . COR_SUBPLAN_TRANSFERENCIA . ' (está en el Contrato Evento)'];
-                }
-            }
-            // lo NO PBS del Contrato Evento va solo en EVENTO NO PBS: si está activo en TRANSFERENCIA, inactivarlo (decisión del usuario, 2026-11-17)
-            if ($l['contrato'] === 'EVENTO' && $l['en_contrato'] === 'SI' && _u($sp) === 'EVENTO NO PBS' && !isset($plusTransfPos[_u($p)])) {
-                $tr = $filas[COR_SUBPLAN_TRANSFERENCIA] ?? null;
-                if ($tr && trim((string) $tr['opcion']) === '1') {
-                    $out["MEDICAR|$cf|$p|" . COR_SUBPLAN_TRANSFERENCIA . '|TRANSF_NO_PBS'] = ['cum_facturar' => $cf, 'plu' => $p, 'item' => null, 'contratos' => $contrato,
-                        'subplan' => COR_SUBPLAN_TRANSFERENCIA, 'campo' => 'TRANSF_NO_PBS', 'actual' => 'Activo (1)', 'esperado' => 'Inactivo (9)', 'revision' => false,
-                        'accion' => "Inactivar el PLU $p en el subplán " . COR_SUBPLAN_TRANSFERENCIA . ' (es NO PBS: va solo en EVENTO NO PBS)'];
                 }
             }
             $m = $filas[_u($sp)] ?? null;
@@ -343,6 +346,27 @@ function cor_calcular_medicar(PDO $pdo): array {
             } elseif ($inv && !isset($inv['todos'][_cor_registro($m['registro_invima'])])) {
                 $add('REGISTRO', $p, $m['registro_invima'], $inv['propuesto'], "Cambiar el Registro Invima del PLU $p a {$inv['propuesto']} (registro del CUM en INVIMA)");
             }
+        }
+    }
+    // Subplanes que sobran (decisión del usuario, 2026-11-20): un PLU con línea activa en la Maestra Tarifaria que está activo en MEDICAR en
+    // un subplán de las combinaciones que no le corresponde se pide inactivar (p.ej. la línea va por CAPITA o EVENTO SAS y sigue en EVENTO POS;
+    // NO PBS activo en TRANSFERENCIA). Otros subplanes (CONSORCIO, CAPITA AUDIFARMA...) no se tocan.
+    $gestionados = ['CAPITA PBS', 'EVENTO POS', 'EVENTO NO PBS', 'EVENTO SAS SIN AUTORIZACION', COR_SUBPLAN_TRANSFERENCIA];
+    $yaPedido = [];
+    foreach ($out as $x) if (str_starts_with($x['campo'], 'ESTADO') || $x['campo'] === 'TRANSF_NO_PBS') $yaPedido[_u($x['plu']) . '|' . _u((string) $x['subplan'])] = true;
+    foreach ($esperado as $p => $subs) {
+        $l = $deLinea[$p];
+        $cf = (string) $l['cum_facturar'];
+        foreach ($gestionados as $s) {
+            $m = $medPlu[$p][$s] ?? null;
+            if (!$m || trim((string) $m['opcion']) !== '1' || isset($subs[$s]) || isset($yaPedido["$p|$s"])) continue;
+            $noPbs = $s === COR_SUBPLAN_TRANSFERENCIA && !empty($l['_no_pos']);
+            $porque = $noPbs ? 'es NO PBS: va solo en EVENTO NO PBS'
+                : 'no le corresponde: va en ' . implode(' + ', array_map(fn($x) => $x === COR_SUBPLAN_TRANSFERENCIA ? 'TRANSFERENCIA DE PENDIENTES' : $x, array_keys($subs)));
+            $campo = $noPbs ? 'TRANSF_NO_PBS' : 'SUBPLAN_SOBRA';
+            $out["MEDICAR|$cf|$p|$s|$campo"] = ['cum_facturar' => $cf, 'plu' => $p, 'item' => null, 'contratos' => (string) $l['contrato_vista'],
+                'subplan' => $s, 'campo' => $campo, 'actual' => 'Activo (1)', 'esperado' => 'Inactivo (9)', 'revision' => false,
+                'accion' => "Inactivar el PLU $p en el subplán $s ($porque)"];
         }
     }
     return $out;

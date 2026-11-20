@@ -48,6 +48,8 @@ function nt_sin_precios(array $f): array {
 function nt_filtros_sin_precios(array $filtros): array { return array_diff_key($filtros, array_flip(NT_CAMPOS_PRECIO)); }
 function nt_contrato_vista(?string $linea): ?string { return $linea === 'EVENTO SAS' ? 'EVENTO' : $linea; }
 const NT_SUBPLAN_SAS = 'EVENTO SAS SIN AUTORIZACION';
+/** Reglas cuya línea se retira con el botón «Retirar» de la Maestra Tarifaria: NT27, NT30 y NT32 (subplán que no corresponde). */
+const NT_CODIGOS_RETIRO = ['NT27', 'NT30', 'NT32'];
 
 /** Fuentes de precio posibles de un subplán (bases de referencia; especificación §4). */
 const SUBPLAN_FUENTES = ['LISTADO_CAPITA', 'CONTRATO_EVENTO', 'LISTADO_EVENTO_SAS', 'LISTADO_CONSORCIO'];
@@ -243,6 +245,11 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
     // Catálogo de subplanes: clasificación CAPITA / EVENTO (fase 7D)
     $subplanCat = [];
     foreach ($pdo->query('SELECT nombre, clasificacion, fuente, activo FROM cat_subplan') as $r) $subplanCat[_u($r['nombre'])] = $r;
+    // Líneas activas de cada producto (CUM FACTURAR), para la regla de combinaciones de subplanes (NT32)
+    $activasCf = [];
+    foreach ($items as $x) if ((int) $x['activo']) $activasCf[_u($x['cum_facturar'])][(string) $x['contrato']] = true;
+    $quitadasCf = []; // líneas ya retiradas de la Maestra Tarifaria (CUM FACTURAR|contrato)
+    foreach ($pdo->query('SELECT cum_facturar, contrato FROM nt_quitada') as $x) $quitadasCf[_u($x['cum_facturar']) . '|' . $x['contrato']] = true;
     $ivaGrupo = [];
     foreach ($pdo->query('SELECT codigo, iva_medicar FROM cat_grupo_impositivo') as $g) $ivaGrupo[$g['codigo']] = ((float) $g['iva_medicar']) / 100;
 
@@ -338,6 +345,7 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
         $mPorRegulado = $regLinea !== null && $v !== null && $p !== null && $v > _nt_peso($regLinea) && $p < $v;
         if ($mPorRegulado) $v = $p;
         $m = [];
+        $nt32Reemplazo = false; // NT32 de la línea EVENTO con su línea CAPITA / EVENTO SAS activa (se recalcula abajo si la línea está activa)
         $marcaRetiro = false; // registro no vigente e inactivo en SIESA y MEDICAR: NT27 (retirar) en lugar de las reglas de creación
         $motivo = function (string $codigo, string $nivel, string $texto) use (&$m) { $m[] = ['codigo' => $codigo, 'nivel' => $nivel, 'texto' => $texto]; };
 
@@ -512,6 +520,28 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
                     . ($pend ? '; ' . implode(', ', $pend) . ' nuevo en SIESA, por definir' : '')
                     . '): dejar uno solo (inactivar el que sobra) o, si el CUM sí lleva varios, «Aprobar varios PLU»');
             }
+            // NT32 (combinaciones de subplanes, decisión del usuario 2026-11-20):
+            //  - POS en el Listado Cápita o en el Listado EVENTO SAS (con su línea CAPITA / EVENTO SAS activa): la línea EVENTO (EVENTO POS) no va;
+            //  - NO POS: va solo en EVENTO NO PBS (línea EVENTO); una línea CAPITA o EVENTO SAS no le corresponde.
+            // La línea se retira de la Maestra Tarifaria (botón «Retirar»); mientras tanto no se pide crearla en MEDICAR.
+            $noPos = _u($posNoPos[$e] ?? '') === 'NO POS';
+            $cfU = _u($d);
+            $enSasLista = isset($sasCum[$cfU]) || isset($sasCod[$e]);
+            $nt32 = null; $nt32Reemplazo = false;
+            if (!$noPos && $k === 'EVENTO') {
+                // con la línea CAPITA / EVENTO SAS activa (la reemplaza) o ya retirada antes (nt_quitada, p.ej. NT27): en el segundo caso el
+                // producto quedaría sin línea, así que solo se marca y el usuario decide (2026-11-20); la migración M042 retira solo los primeros
+                $lin = fn(string $c) => isset($activasCf[$cfU][$c]) ? 'activa' : (isset($quitadasCf["$cfU|$c"]) ? 'quitada' : null);
+                $por = array_filter(['el Listado Cápita (subplán CAPITA PBS)' => isset($capita[$e]) ? $lin('CAPITA') : null,
+                    'el Listado EVENTO SAS (subplán EVENTO SAS SIN AUTORIZACION)' => $enSasLista ? $lin('EVENTO SAS') : null]);
+                $nt32Reemplazo = in_array('activa', $por, true);
+                if ($por) $nt32 = 'Es POS y está en ' . implode(' y en ', array_keys($por)) . ': la línea EVENTO (EVENTO POS) no le corresponde; retirarla de la Maestra Tarifaria'
+                    . ($nt32Reemplazo ? '' : ' (su línea ' . (isset($capita[$e]) ? 'CAPITA' : 'EVENTO SAS') . ' ya fue retirada: si retira esta, el producto sale de la Maestra Tarifaria)');
+            } elseif ($noPos && in_array($k, ['CAPITA', 'EVENTO SAS'], true)) {
+                $nt32 = 'Es NO POS: va solo en EVENTO NO PBS (línea EVENTO), no en ' . nt_subplan_linea($k, null) . ': retirar esta línea de la Maestra Tarifaria'
+                    . (isset($activasCf[$cfU]['EVENTO']) ? '' : ' y crear la línea EVENTO');
+            }
+            if ($nt32 !== null) { $motivo('NT32', 'ERROR', $nt32); $marcaRetiro = true; }
             $sinNada = false;
             if ($cargaMedicar && !$marcaRetiro) { // con la marca de retiro (NT27 por registro) no se pide crear ni se repite NT27
                 $mx = $medLinea;
@@ -586,6 +616,10 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
             'precio_maximo' => $v,
             'precio_m_propio' => $mPorRegulado, // el M del grupo supera el regulado: se usa el precio de la línea
             'en_contrato' => $enContrato,
+            // para Inconsistencias MEDICAR (TRANSFERENCIA DE PENDIENTES): el COD MUTUAL está en el Contrato Evento y la categoría del COD GEN
+            '_en_ctr_evento' => $j !== '' && isset($contrato[$j]),
+            '_no_pos' => _u($posNoPos[$e] ?? '') === 'NO POS',
+            '_nt32_reemplazo' => $nt32Reemplazo, // NT32 con la línea CAPITA / EVENTO SAS activa (la migración M042 retira solo esas)
             'precio_contrato' => $precioContrato,
             'precio_correcto' => $precioCorrecto,
             'cum_codigo' => $cumCodigo,
@@ -625,7 +659,7 @@ function nt_listar(PDO $pdo, array $filtros, int $pagina, int $tam): array {
                 'no_contrato' => 0, 'glosa' => 0, 'capita_precio' => 0, 'evento_sas_id' => 0, 'no_corresponde' => 0, 'capita_id' => 0,
                 'contratos' => array_fill_keys(NT_CONTRATOS, 0), 'lineas_por_repetir' => count(nt_lineas_faltantes($pdo)),
                 'precio_uno' => 0, 'precio_uno_pendiente' => 0,
-                'inactivas_medicar' => count(array_filter($todas, fn($f) => (int) $f['activo'] && array_intersect(['NT27', 'NT30'], array_column($f['motivos'], 'codigo'))))];
+                'inactivas_medicar' => count(array_filter($todas, fn($f) => (int) $f['activo'] && array_intersect(NT_CODIGOS_RETIRO, array_column($f['motivos'], 'codigo'))))];
     foreach ($todas as $f) {
         $resumen[$f['estado']]++;
         if ($f['estado'] !== 'INACTIVO') {
@@ -791,6 +825,7 @@ function _nt_filtrar(array $filas, array $filtros, ?string $excluir = null): arr
  *  - CAPITA: su COD AUF está en el Listado Cápita (precio = tarifa pactada, sin IVA);
  *  - EVENTO: su COD MUTUAL está en el Contrato Evento (precio = el del producto, con tope en el valor unitario del contrato);
  *  - EVENTO SAS: su CUM (o, si el listado no trae CUM, su COD AUF) está en el Listado EVENTO SAS (precio = el del producto, con tope en el contrato).
+ * Desde 2026-11-20 con las combinaciones de subplanes: la línea EVENTO no se pide si va por CAPITA o EVENTO SAS; un NO POS solo lleva EVENTO.
  * La línea nueva copia los datos de la línea existente del producto (decisión del usuario: precio de la base).
  */
 function nt_lineas_faltantes(PDO $pdo): array {
@@ -810,6 +845,8 @@ function nt_lineas_faltantes(PDO $pdo): array {
     $st = $pdo->prepare('SELECT cod_gen, precio_regulado FROM ref_precio_regulado WHERE carga_id = ? ORDER BY id');
     $st->execute([_carga_vigente($pdo, 'PRECIOS_REGULADOS')]);
     foreach ($st as $r) $regulado[_u($r['cod_gen'])] = (float) $r['precio_regulado'];
+    $posNoPos = [];
+    foreach ($pdo->query('SELECT cod_gen_audifarma, pos_no_pos FROM cat_molecula') as $r) $posNoPos[_u($r['cod_gen_audifarma'])] = $r['pos_no_pos'];
 
     $porCum = [];
     foreach ($pdo->query('SELECT * FROM nt_item WHERE activo = 1 ORDER BY id') as $it) $porCum[_u($it['cum_facturar'])][$it['contrato']] ??= $it;
@@ -824,11 +861,17 @@ function nt_lineas_faltantes(PDO $pdo): array {
         $iva = (float) $base['iva'];
         $ctr = $j !== '' ? ($contrato[$j] ?? null) : null;
         $valorCtr = $ctr ? ($ctr[$tipo] ?? reset($ctr)) : null;
+        // Combinaciones de subplanes (decisión del usuario, 2026-11-20): NO POS → solo EVENTO (EVENTO NO PBS); POS → CAPITA si está en el
+        // Listado Cápita, EVENTO SAS si está en el Listado EVENTO SAS y en el Contrato Evento, y EVENTO (EVENTO POS) solo si está en el
+        // Contrato Evento y no va por ninguno de los dos listados. TRANSFERENCIA DE PENDIENTES no es línea: se valida en Inconsistencias MEDICAR.
+        $noPos = _u($posNoPos[$e] ?? '') === 'NO POS';
+        $enCapita = !$noPos && isset($capita[$e]);
+        $enSas = !$noPos && (isset($sasCum[$cf]) || isset($sasCod[$e])) && $ctr;
         $requeridos = array_filter([
-            'CAPITA' => isset($capita[$e]) ? $capita[$e] : false,
-            'EVENTO' => $ctr ? $valorCtr : false,
+            'CAPITA' => $enCapita ? $capita[$e] : false,
+            'EVENTO' => $ctr && !$enCapita && !$enSas ? $valorCtr : false,
             // EVENTO SAS: Listado EVENTO SAS y el COD MUTUAL en el Contrato Evento (2026-11-11: solo entra si está en el contrato)
-            'EVENTO SAS' => (isset($sasCum[$cf]) || isset($sasCod[$e])) && $ctr ? $valorCtr : false,
+            'EVENTO SAS' => $enSas ? $valorCtr : false,
         ], fn($x) => $x !== false);
         foreach ($requeridos as $k => $valor) {
             if (isset($existe["$cf|$k"])) continue; // también si existe inactiva: no se vuelve a crear
@@ -904,36 +947,45 @@ function nt_validar_cum(PDO $pdo, string $cumFacturar, bool $validar, int $usuar
 }
 
 /**
- * Quita de la Maestra Tarifaria las líneas inactivas en MEDICAR en su subplán (NT27). Decisión del usuario (2026-10-11):
- * no quedan como inactivas; antes de quitarlas la Maestra Tarifaria completa se guarda como VERSIÓN ANTERIOR (Excel en el historial
- * de versiones) y cada línea queda en nt_quitada y en auditoría (no se vuelve a proponer).
+ * Quita de la Maestra Tarifaria las líneas que se retiran (NT_CODIGOS_RETIRO): inactivas en SIESA y MEDICAR (NT27), sin PLU en ninguno
+ * (NT30) o en un subplán que no corresponde a su combinación (NT32, 2026-11-20). Decisión del usuario (2026-10-11): no quedan como
+ * inactivas; antes de quitarlas la Maestra Tarifaria completa se guarda como VERSIÓN ANTERIOR (Excel en el historial de versiones) y
+ * cada línea queda en nt_quitada y en auditoría (no se vuelve a proponer). $codigos / $contrato: solo esas reglas / ese contrato
+ * (la migración M042 retira de una vez solo las líneas EVENTO con NT32 cuya línea CAPITA / EVENTO SAS está activa: $filtro). $usuarioId null = migración.
  */
-function nt_quitar_medicar(PDO $pdo, int $usuarioId): array {
+function nt_quitar_medicar(PDO $pdo, ?int $usuarioId, array $codigos = NT_CODIGOS_RETIRO, ?string $contrato = null, ?callable $filtro = null): array {
     $quitar = [];
     foreach (nt_calcular($pdo, true)['filas'] as $f) {
-        if ((int) $f['activo'] && array_intersect(['NT27', 'NT30'], array_column($f['motivos'], 'codigo'))) $quitar[(int) $f['id']] = $f;
+        if ((int) $f['activo'] && ($contrato === null || $f['contrato'] === $contrato) && (!$filtro || $filtro($f)) && array_intersect($codigos, array_column($f['motivos'], 'codigo'))) $quitar[(int) $f['id']] = $f;
     }
     if (!$quitar) return ['lineas' => 0, 'version' => null];
-    $motivo = 'Inactiva en SIESA y MEDICAR (NT27) o sin PLU en ninguno (NT30)';
-    $v = nt_guardar_version($pdo, "Versión anterior: antes de retirar " . count($quitar) . " líneas inactivas en SIESA y MEDICAR o sin PLU", $usuarioId,
-        ['motivo' => $motivo, 'quitadas' => array_values(array_map(fn($f) => "{$f['cum_facturar']} ({$f['contrato']}) {$f['plu_medicar']}", $quitar))]);
+    $nombres = ['NT27' => 'Inactiva en SIESA y MEDICAR (NT27)', 'NT30' => 'Sin PLU en SIESA ni en MEDICAR (NT30)', 'NT32' => 'Subplán que no corresponde a su combinación (NT32)'];
+    $motivo = implode(' / ', array_intersect_key($nombres, array_flip($codigos)));
+    $v = nt_guardar_version($pdo, "Versión anterior: antes de retirar " . count($quitar) . ' líneas (' . implode(', ', $codigos) . ')', $usuarioId,
+        // en MySQL ref_carga.detalle es TEXT (64 KB): con miles de líneas solo va una muestra; cada línea queda en nt_quitada y en auditoría
+        ['motivo' => $motivo, 'total_quitadas' => count($quitar),
+         'quitadas' => array_values(array_map(fn($f) => "{$f['cum_facturar']} ({$f['contrato']}) " . mb_substr((string) $f['plu_medicar'], 0, 60), array_slice($quitar, 0, 300, true)))]);
     $st = $pdo->prepare('SELECT * FROM nt_item WHERE id = ?');
     foreach ($quitar as $id => $f) {
         $st->execute([$id]);
         $fila = $st->fetch();
+        $cods = array_column($f['motivos'], 'codigo');
+        $mot = in_array('NT32', $cods, true) && in_array('NT32', $codigos, true)
+            ? 'Subplán que no corresponde (NT32): ' . implode(' ', array_column(array_filter($f['motivos'], fn($x) => $x['codigo'] === 'NT32'), 'texto'))
+            : (in_array('NT30', $cods, true) ? 'Sin PLU en SIESA ni en MEDICAR (NT30)' : "Inactiva en SIESA y MEDICAR (NT27): {$f['plu_medicar']}");
         insertar($pdo, 'nt_quitada', ['cum_facturar' => $fila['cum_facturar'], 'contrato' => $fila['contrato'], 'cod_auf' => $fila['cod_auf'],
-            'motivo' => (in_array('NT30', array_column($f['motivos'], 'codigo'), true) ? 'Sin PLU en SIESA ni en MEDICAR (NT30)' : "Inactiva en SIESA y MEDICAR (NT27): {$f['plu_medicar']}"), 'carga_id' => $v['carga_id'], 'datos' => json_encode($fila, JSON_UNESCAPED_UNICODE),
+            'motivo' => mb_substr($mot, 0, 250), 'carga_id' => $v['carga_id'], 'datos' => json_encode($fila, JSON_UNESCAPED_UNICODE),
             'quitado_por' => $usuarioId, 'quitado_en' => ahora()]);
         $pdo->prepare('DELETE FROM nt_precio_calculo WHERE nt_item_id = ?')->execute([$id]);
         $pdo->prepare('UPDATE nt_producto SET nt_item_id = NULL WHERE nt_item_id = ?')->execute([$id]);
         $pdo->prepare('DELETE FROM nt_item WHERE id = ?')->execute([$id]);
-        auditar($usuarioId, 'NT_QUITAR', 'nt_item', $id, $fila, ['motivo' => "$motivo: {$f['plu_medicar']}", 'version_anterior' => $v['version']]);
+        auditar($usuarioId, 'NT_QUITAR', 'nt_item', $id, $fila, ['motivo' => $mot, 'version_anterior' => $v['version']]);
     }
     return ['lineas' => count($quitar), 'version' => $v['version']];
 }
 
 /** Guarda la Maestra Tarifaria actual (exportación completa) como una versión del historial de la Maestra Tarifaria. */
-function nt_guardar_version(PDO $pdo, string $origen, int $usuarioId, array $detalle = []): array {
+function nt_guardar_version(PDO $pdo, string $origen, ?int $usuarioId, array $detalle = []): array {
     $version = (int) $pdo->query("SELECT COALESCE(MAX(version), 0) FROM ref_carga WHERE tipo_base = 'NOTA_TECNICA'")->fetchColumn() + 1;
     $dir = __DIR__ . '/../data/bases/NOTA_TECNICA';
     if (!is_dir($dir) && !mkdir($dir, 0775, true)) throw new RuntimeException("No se pudo crear $dir");
@@ -1536,10 +1588,14 @@ function nt_sugerencia(PDO $pdo, string $codAuf, string $cumFacturar, string $co
         $st->execute([_carga_vigente($pdo, 'CONTRATO_EVENTO_22382'), $r['cod_mutual']]);
         foreach ($st as $c) $r['contrato_evento'][(string) $c['cod_servicio']] = ['valor' => (float) $c['valor_unitario'], 'estado' => $c['estado']];
     }
-    // Contratos donde se crea el producto nuevo (decisión del usuario, 2026-10-03): siempre EVENTO (si el ID MUTUAL no
-    // está en el Contrato Evento queda con error NT01), más CAPITA si está en el Listado Cápita y EVENTO SAS si
-    // está en el Listado EVENTO SAS.
-    $r['contratos'] = array_values(array_filter([$r['tarifa_capita'] !== null ? 'CAPITA' : null, $r['en_evento_sas'] ? 'EVENTO SAS' : null, 'EVENTO']));
+    // Contratos donde se crea el producto nuevo: combinaciones de subplanes (decisión del usuario, 2026-11-20; reemplaza la de
+    // 2026-10-03 «siempre EVENTO»). NO POS → solo EVENTO (EVENTO NO PBS). POS → CAPITA si está en el Listado Cápita, EVENTO SAS si
+    // está en el Listado EVENTO SAS y, solo si no va por ninguno de los dos, EVENTO (EVENTO POS).
+    $noPos = _u($r['molecula']['pos_no_pos'] ?? '') === 'NO POS';
+    $r['no_pos'] = $noPos;
+    $r['contratos'] = $noPos ? ['EVENTO']
+        : (array_values(array_filter([$r['tarifa_capita'] !== null ? 'CAPITA' : null, $r['en_evento_sas'] ? 'EVENTO SAS' : null])) ?: ['EVENTO']);
+    if ($noPos) $r['contrato_sugerido'] = 'EVENTO';
     // contratos en los que el producto aún no está (2026-11-11): no se incluyen en la Maestra Tarifaria hasta que esté en el contrato
     $r['fuera_de_contrato'] = [];
     foreach ($r['contratos'] as $k) if ($m = nt_fuera_de_contrato($r, $k)) $r['fuera_de_contrato'][$k] = $m;

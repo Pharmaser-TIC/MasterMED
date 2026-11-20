@@ -1668,11 +1668,11 @@ async function pNota(c) {
           const res = await api('nt_repetir_lineas', { metodo: 'POST' });
           toast(`${miles(res.lineas)} líneas creadas en los contratos que faltaban.`); recargar();
         } }, svgIcono('crear'), `Crear ${miles(x.lineas_por_repetir)} líneas en otros contratos`) : '',
-        x.inactivas_medicar && gestionar ? h('button', { class: 'btn sec resaltado', title: 'Líneas inactivas en SIESA y MEDICAR (NT27) o sin PLU en ninguno (NT30)', onclick: async () => {
-        if (!await confirmar('Retirar de la Maestra Tarifaria', `Se retiran ${miles(x.inactivas_medicar)} líneas: inactivas en SIESA y en MEDICAR (NT27) o sin PLU en ninguno de los dos (NT30). Antes se guarda la Maestra Tarifaria completa como versión anterior (se consulta y descarga en «Versiones»). Las líneas retiradas no se vuelven a proponer.`, 'Retirar')) return;
+        x.inactivas_medicar && gestionar ? h('button', { class: 'btn sec resaltado', title: 'Líneas inactivas en SIESA y MEDICAR (NT27), sin PLU en ninguno (NT30) o en un subplán que no les corresponde (NT32)', onclick: async () => {
+        if (!await confirmar('Retirar de la Maestra Tarifaria', `Se retiran ${miles(x.inactivas_medicar)} líneas: inactivas en SIESA y en MEDICAR (NT27), sin PLU en ninguno de los dos (NT30) o en un subplán que no les corresponde (NT32: p.ej. la línea EVENTO de un producto que va por CAPITA o EVENTO SAS). Antes se guarda la Maestra Tarifaria completa como versión anterior (se consulta y descarga en «Versiones»). Las líneas retiradas no se vuelven a proponer.`, 'Retirar')) return;
         const res = await api('nt_quitar_medicar', { metodo: 'POST' });
         toast(`${miles(res.lineas)} líneas quitadas. La Maestra Tarifaria anterior quedó como versión ${res.version}.`); recargar();
-      } }, svgIcono('quitar'), `Retirar ${miles(x.inactivas_medicar)} (inactivas o sin PLU)`) : '',
+      } }, svgIcono('quitar'), `Retirar ${miles(x.inactivas_medicar)} (inactivas, sin PLU o sin subplán)`) : '',
         h('button', { class: 'btn sec', title: 'Historial de versiones de la Maestra Tarifaria', onclick: () => versionesNT() }, svgIcono('capas'), 'Versiones'),
         h('button', { class: 'btn sec', title: 'Cambios de la Maestra Tarifaria por fecha (creadas, editadas, quitadas, importaciones)', onclick: () => cambiosNT() }, svgIcono('reloj'), 'Cambios'),
         h('button', { class: 'btn sec', title: 'CUM revisados que sí deben tener varios PLU activos en la Maestra Tarifaria', onclick: () => aprobacionesVariosPlu(gestionar, recargar) }, svgIcono('ok'), 'Varios PLU aprobados'),
@@ -2054,7 +2054,7 @@ function nuevoNT(alGuardar, base = {}) {
         h('div', { class: 'ancho-total nt-calc' }, h('strong', {}, 'Calculadora de precio de venta:'), 'Precio de compra', compra, '+ margen', pct, '%', resultadoCalc,
           h('span', { class: 'nota', style: 'width:100%' }, 'Ejemplo: compra $ 10.000 + margen 20 % = precio de venta $ 12.000 (sin IVA). Se usa si no hay tarifa cápita ni precio del contrato; tope: precio regulado.')),
         h('div', { class: 'ancho-total' }, h('strong', {}, 'Líneas que se crean '),
-          h('span', { class: 'nota' }, '(solo en los contratos que ya tienen el producto: CAPITA si está en el Listado Cápita; EVENTO si el ID MUTUAL está en el Contrato Evento; EVENTO SAS si además está en el Listado EVENTO SAS)'), lineasZona))),
+          h('span', { class: 'nota' }, '(solo en los contratos que ya tienen el producto. POS: CAPITA si está en el Listado Cápita; EVENTO SAS si está en el Listado EVENTO SAS y en el Contrato Evento; EVENTO (EVENTO POS) solo si está en el Contrato Evento y no va por ninguno de los dos listados. NO POS: solo EVENTO (EVENTO NO PBS))'), lineasZona))),
     err,
     h('div', { class: 'form-pie' }, h('span', { class: 'nota' }, h('span', { class: 'req' }, '* '), 'Campos obligatorios'), h('span', { class: 'espacio' }),
       apr ? h('button', { type: 'button', class: 'btn sec', onclick: () => apr.volver() }, '← Volver a aprobaciones') : '',
@@ -2451,7 +2451,7 @@ const EDITORES = {
     campos: [
       ...(f ? [{ tipo: 'solo_lectura', etiqueta: 'ID / Subplán', valor: `${f.id_subplan} · ${f.nombre}` }]
         : [{ nombre: 'id_subplan', etiqueta: 'ID del subplán en Medicar', tipo: 'number', requerido: true }, { nombre: 'nombre', etiqueta: 'Nombre', requerido: true }]),
-      { nombre: 'clasificacion', etiqueta: 'Clasificación del contrato', tipo: 'select', valor: f?.clasificacion ?? '', opciones: [['', '(sin parametrizar)'], ['CAPITA', 'CAPITA'], ['EVENTO', 'EVENTO']] },
+      { nombre: 'clasificacion', etiqueta: 'Clasificación del contrato', tipo: 'select', valor: f?.clasificacion ?? '', opciones: [['', '(sin parametrizar)'], ['CAPITA', 'CAPITA'], ['EVENTO', 'EVENTO'], ['VALIDACION', 'Solo validación MEDICAR (no es de la Maestra Tarifaria)']] },
       { nombre: 'fuente', etiqueta: 'Fuente de precio (base de referencia)', tipo: 'select', valor: f?.fuente ?? '',
         opciones: [['', '(ninguna)'], ['LISTADO_CAPITA', 'Listado Cápita'], ['CONTRATO_EVENTO', 'Contrato Evento'], ['LISTADO_EVENTO_SAS', 'Listado EVENTO SAS'], ['LISTADO_CONSORCIO', 'Listado Consorcio']] },
       ...(f ? [{ nombre: 'activo', etiqueta: 'Activo', tipo: 'checkbox', valor: Number(f.activo) }] : []),

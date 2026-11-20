@@ -306,6 +306,13 @@ function migraciones_datos(PDO $pdo): array {
             $pdo->exec("DELETE FROM proc_resultado WHERE regla_codigo IN ('A04', 'NT17')");
             $pdo->exec("DELETE FROM proc_regla WHERE codigo IN ('A04', 'NT17')");
         }],
+        'M042_COMBINACIONES_SUBPLANES' => ['Combinaciones de subplanes: TRANSFERENCIA DE PENDIENTES es solo validación de MEDICAR y se retiran las líneas EVENTO de los POS que van por CAPITA o EVENTO SAS (NT32) (pedido del usuario, 2026-11-20)', function (PDO $pdo) {
+            $pdo->exec("UPDATE cat_subplan SET clasificacion = 'VALIDACION', fuente = NULL WHERE UPPER(nombre) LIKE 'TRANSFERENCIA DE PENDIENTES%'");
+            // retiro de una vez (decisión del usuario): solo las líneas EVENTO con NT32; antes se guarda la Maestra Tarifaria como versión anterior
+            foreach (['auth.php', 'bases.php', 'nota_tecnica.php'] as $lib) require_once __DIR__ . '/' . $lib;
+            $r = nt_quitar_medicar($pdo, null, ['NT32'], 'EVENTO', fn(array $f) => !empty($f['_nt32_reemplazo']));
+            if ($r['lineas']) auditar(null, 'NT_QUITAR_M042', 'nt_item', null, null, $r);
+        }],
         'M041_APROBACION_SIN_PRODUCTO' => ['Aprobaciones sin producto: el usuario de creación crea COD GEN desde el catálogo y el Administrador aprueba (pedido del usuario, 2026-11-17)', function (PDO $pdo) {
             if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql') { $pdo->exec('ALTER TABLE proc_aprobacion MODIFY lote_item_id INT NULL'); return; }
             // SQLite no cambia una columna: se reconstruye la tabla con los mismos datos
@@ -596,6 +603,7 @@ function semilla_reglas(PDO $pdo): void {
         ['NT27', 'Maestra Tarifaria: inactiva en SIESA y en MEDICAR (también con registro no vigente)', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)'],
         ['NT30', 'Maestra Tarifaria: sin PLU en SIESA ni en MEDICAR', 'ERROR', 'Maestro SIESA / Maestra MEDICAR', 'Crear el producto (Crear productos) o, si la línea ya no se usa, retirarla de la Maestra Tarifaria'],
         ['NT31', 'Maestra Tarifaria: el registro sanitario o su estado, editado en la Maestra Tarifaria, no coincide con INVIMA (si el CUM no está en INVIMA no aplica)', 'ALERTA', 'INVIMA', 'Revisar con INVIMA; si INVIMA está bien, el Administrador aprueba «Actualizar con INVIMA»'],
+        ['NT32', 'Maestra Tarifaria: la línea no corresponde a la combinación de subplanes (POS en Listado Cápita o EVENTO SAS no lleva línea EVENTO; NO POS va solo en EVENTO NO PBS)', 'ERROR', 'Listado Cápita / Listado EVENTO SAS / COD GEN', 'Retirar la línea de la Maestra Tarifaria (botón «Retirar»; queda en la versión anterior)'],
         ['NT14', 'Maestra Tarifaria: el código Medicar del catálogo COD GEN no coincide con el prefijo del PLU en SIESA', 'ALERTA', 'COD GEN / Maestro SIESA', 'Revisar el código Medicar en el catálogo COD GEN (el PLU de SIESA no se cambia)'],
         ['NT16', 'Maestra Tarifaria: el producto está inactivo en el contrato',                 'ALERTA', 'Contrato Evento', 'Confirmar con el contrato'],
         ['A05', 'Precio 1 con excepción aprobada',                                'ALERTA', 'Maestra Tarifaria',        'Verificar la excepción'],
