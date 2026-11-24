@@ -618,6 +618,8 @@ function nt_calcular(PDO $pdo, bool $refrescar = false): array {
             'en_contrato' => $enContrato,
             // para Inconsistencias MEDICAR (TRANSFERENCIA DE PENDIENTES): el COD MUTUAL está en el Contrato Evento y la categoría del COD GEN
             '_en_ctr_evento' => $j !== '' && isset($contrato[$j]),
+            // columna CONTRATO EVENTO (pedido del usuario, 2026-11-23): el COD MUTUAL de la línea está como ID MUTUAL en el Contrato Evento
+            'contrato_evento' => $j !== '' && isset($contrato[$j]) ? 'SI' : 'NO',
             '_no_pos' => _u($posNoPos[$e] ?? '') === 'NO POS',
             '_nt32_reemplazo' => $nt32Reemplazo, // NT32 con la línea CAPITA / EVENTO SAS activa (la migración M042 retira solo esas)
             'precio_contrato' => $precioContrato,
@@ -781,7 +783,7 @@ function _nt_medicar(array $plus, string $cum, array $subplanes, array $medPlu, 
 
 /** Columnas de la Maestra Tarifaria que se pueden filtrar. */
 const NT_FILTRABLES = ['contrato_vista', 'cum', 'cum_facturar', 'fecha', 'cod_auf', 'tipo_producto', 'clasificacion_entrega', 'descripcion', 'cod_gen_siesa', 'cod_mutual',
-    'referencia_siesa', 'descripcion_siesa', 'atc', 'ffm_rips', 'umm_rips', 'upr_rips', 'medicar', 'plu_medicar', 'subplan', 'clasificacion',
+    'contrato_evento', 'referencia_siesa', 'descripcion_siesa', 'atc', 'ffm_rips', 'umm_rips', 'upr_rips', 'medicar', 'plu_medicar', 'subplan', 'clasificacion',
     'precio_venta', 'iva', 'contrato', 'en_contrato', 'precio_correcto', 'cum_codigo', 'estado', 'reglas',
     'precio_final', 'precio_contrato', 'precio_maximo', 'precio_regulado', 'cumple_regulado', 'tarifa_capita', 'precio_capita_ok', 'activo_estado'];
 
@@ -1771,7 +1773,7 @@ function nt_exportar(PDO $pdo, string $destino, array $filtros = [], bool $soloE
     // Activo / Inactivo de primera, las líneas inactivas incluidas y OBSERVACIONES con Validada / Alerta / Error).
     // Se puede volver a importar (el lector acepta FECHA DE CREACION y no exige COD MUTUAL FINAL; ESTADO no se importa).
     $enc = ['ESTADO', 'FECHA DE CREACION', 'CONTRATO', 'SUBPLAN', 'CUM', 'CUM FACTURAR', 'COD AUF', 'TIPO PRODUCTO', 'DESCRIPCION', 'COD GEN SIESA',
-            'PLU', 'DESCRIPCION COMPLETA', 'ATC', 'COD MUTUAL', "PRECIO DE VENTA $anio", 'IVA', 'PRECIO FINAL + IVA', '¿ESTA EN EL CONTRATO?',
+            'PLU', 'DESCRIPCION COMPLETA', 'ATC', 'COD MUTUAL', 'CONTRATO EVENTO', "PRECIO DE VENTA $anio", 'IVA', 'PRECIO FINAL + IVA', '¿ESTA EN EL CONTRATO?',
             'PRECIO CONTRATO', '¿PRECIO CORRECTO - M?', 'PRECIO REGULADO', 'FORMA FARMACEUTICA RIPS', 'CONCENTRACION RIPS', 'UNIDAD MEDIDA RIPS',
             'CLASIFICACION DE ENTREGA', 'OBSERVACIONES'];
     if ($soloErrores) $enc[] = 'CÓMO CORREGIR';
@@ -1785,7 +1787,7 @@ function nt_exportar(PDO $pdo, string $destino, array $filtros = [], bool $soloE
             $obs = $f['estado'] === 'INACTIVO' && empty($f['plu_pendiente']) ? 'No se valida (inactivo)'
                 : implode(' · ', [$etq, ...array_map(fn($m) => "{$m['codigo']}: {$m['texto']}", $f['motivos'])]);
             yield [(int) $f['activo'] ? 'Activo' : 'Inactivo', $f['fecha'], $f['contrato_vista'], $f['subplan'], $f['cum'], $f['cum_facturar'], $f['cod_auf'], $f['tipo_producto'], $f['descripcion'],
-                   $f['cod_gen_siesa_calc'], $f['referencia_siesa'], $f['descripcion_siesa'], $f['atc'], $f['cod_mutual'],
+                   $f['cod_gen_siesa_calc'], $f['referencia_siesa'], $f['descripcion_siesa'], $f['atc'], $f['cod_mutual'], $f['contrato_evento'],
                    $num($f['precio_venta']), $num($f['iva']), $num($f['precio_final']), $f['en_contrato'],
                    $f['precio_contrato'] === null ? ($f['contrato'] === 'CAPITA' ? 'NO ESTA EN EL LISTADO CAPITA' : 'NO ESTA EN EL CONTRATO') : $num($f['precio_contrato']),
                    $num($f['precio_maximo']), $num($f['precio_regulado']), $f['ffm_rips'], $f['umm_rips'], $f['upr_rips'], $f['clasificacion_entrega'],

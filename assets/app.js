@@ -1794,6 +1794,8 @@ async function pNota(c) {
     { titulo: 'DESCRIPCION COMPLETA', campo: 'descripcion_siesa', valor: (f) => h('div', { class: 'desc-linea', title: f.descripcion_siesa ?? '' }, f.descripcion_siesa ?? '') },
     { titulo: 'ATC', campo: 'atc' },
     { titulo: 'COD MUTUAL', campo: 'cod_mutual' },
+    // SI / NO: el COD MUTUAL está como ID MUTUAL en el Contrato Evento (pedido del usuario, 2026-11-23)
+    { titulo: 'CONTRATO EVENTO', campo: 'contrato_evento', clase: colorDe('contrato_evento') },
     { titulo: `PRECIO DE VENTA ${meta.anio_precio || ''}`.trim(), campo: 'precio_venta', num: true, valor: (f) => num(f.precio_venta) },
     { titulo: 'IVA', campo: 'iva', num: true, valor: (f) => String(Number(f.iva || 0)).replace('.', ',') },
     { titulo: 'PRECIO FINAL + IVA', campo: 'precio_final', num: true, valor: (f) => num(f.precio_final) },
